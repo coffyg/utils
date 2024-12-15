@@ -22,9 +22,6 @@ type RedisSafeMap[V any] struct {
 
 // NewRedisMap returns a new Redis-backed map.
 func NewRedisMap[V any]() *RedisSafeMap[V] {
-	if redisClient == nil {
-		panic("redisClient is not set. Call SetRedisClientForUtils first.")
-	}
 	return &RedisSafeMap[V]{}
 }
 
