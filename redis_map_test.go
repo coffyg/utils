@@ -309,3 +309,44 @@ func TestSafeMapRedisRange(t *testing.T) {
 		}
 	}
 }
+func TestRedisMapClientDifferentDB(t *testing.T) {
+	// Create a new Redis client pointing to a different DB (e.g., DB = 1)
+	customClient := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+		DB:   1, // Use DB #1 instead of the default DB #0
+	})
+
+	// Verify that the custom client is reachable
+	if err := customClient.Ping(ctx).Err(); err != nil {
+		t.Fatalf("Failed to connect to Redis DB=1: %v", err)
+	}
+
+	// Clear DB=1 before tests
+	if err := customClient.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("Failed to flush DB=1: %v", err)
+	}
+
+	// Create a new Redis map with the *custom* client
+	customMap := NewRedisMapClient[int](customClient)
+
+	// Insert data into the custom map (DB=1)
+	customMap.Set("key_db1", 42)
+
+	// Verify the data is present in DB=1
+	val, exists := customMap.Get("key_db1")
+	if !exists || val != 42 {
+		t.Errorf("Expected key_db1 in DB=1 to have value 42, got %v", val)
+	}
+
+	// Now check the *global* map (which by default points to DB=0)
+	globalMap := NewRedisMap[int]() // uses the global redisClient (DB=0)
+	valGlobal, existsGlobal := globalMap.Get("key_db1")
+	if existsGlobal {
+		t.Errorf("Did not expect to find key_db1 in the global map (DB=0), but got value %v", valGlobal)
+	}
+
+	// Clean up DB=1
+	if err := customClient.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("Failed to flush DB=1 after test: %v", err)
+	}
+}

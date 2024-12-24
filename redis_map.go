@@ -18,11 +18,28 @@ func SetRedisClientForUtils(client *redis.Client) {
 
 // RedisSafeMap is a Redis-backed implementation of the same API as SafeMap.
 type RedisSafeMap[V any] struct {
+	// If customClient is non-nil, we'll use it instead of the global redisClient.
+	customClient *redis.Client
 }
 
-// NewRedisMap returns a new Redis-backed map.
+// NewRedisMap returns a new Redis-backed map that uses the global redisClient.
 func NewRedisMap[V any]() *RedisSafeMap[V] {
 	return &RedisSafeMap[V]{}
+}
+
+// NewRedisMapClient returns a new Redis-backed map using a *custom* client.
+func NewRedisMapClient[V any](client *redis.Client) *RedisSafeMap[V] {
+	return &RedisSafeMap[V]{
+		customClient: client,
+	}
+}
+
+// Helper methods to get the correct client.
+func (m *RedisSafeMap[V]) getClient() *redis.Client {
+	if m.customClient != nil {
+		return m.customClient
+	}
+	return redisClient
 }
 
 // Helper functions for serialization.
@@ -43,7 +60,7 @@ func decodeValue[V any](data string) (V, error) {
 // Get retrieves the value for the given key.
 func (m *RedisSafeMap[V]) Get(key string) (V, bool) {
 	var zero V
-	data, err := redisClient.Get(ctx, key).Result()
+	data, err := m.getClient().Get(ctx, key).Result()
 	if err == redis.Nil {
 		return zero, false
 	} else if err != nil {
@@ -60,7 +77,7 @@ func (m *RedisSafeMap[V]) Get(key string) (V, bool) {
 
 // Exists checks if the key exists in the map.
 func (m *RedisSafeMap[V]) Exists(key string) bool {
-	count, err := redisClient.Exists(ctx, key).Result()
+	count, err := m.getClient().Exists(ctx, key).Result()
 	if err != nil || count == 0 {
 		return false
 	}
@@ -73,7 +90,7 @@ func (m *RedisSafeMap[V]) Set(key string, value V) {
 	if err != nil {
 		return
 	}
-	redisClient.Set(ctx, key, data, 0) // no expiration
+	m.getClient().Set(ctx, key, data, 0) // no expiration
 }
 
 // SetWithExpireDuration inserts or updates the value with an expiration duration.
@@ -82,12 +99,12 @@ func (m *RedisSafeMap[V]) SetWithExpireDuration(key string, value V, expireDurat
 	if err != nil {
 		return
 	}
-	redisClient.Set(ctx, key, data, expireDuration)
+	m.getClient().Set(ctx, key, data, expireDuration)
 }
 
 // Len returns the total number of entries (non-expired).
 func (m *RedisSafeMap[V]) Len() int {
-	keys, err := redisClient.Keys(ctx, "*").Result()
+	keys, err := m.getClient().Keys(ctx, "*").Result()
 	if err != nil {
 		return 0
 	}
@@ -96,18 +113,18 @@ func (m *RedisSafeMap[V]) Len() int {
 
 // Delete removes the entry for the given key.
 func (m *RedisSafeMap[V]) Delete(key string) {
-	redisClient.Del(ctx, key)
+	m.getClient().Del(ctx, key)
 }
 
 // Range iterates over all entries. If f returns false, iteration stops.
 func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
 	// NOTE: Using KEYS * for demonstration. For large datasets, consider SCAN.
-	keys, err := redisClient.Keys(ctx, "*").Result()
+	keys, err := m.getClient().Keys(ctx, "*").Result()
 	if err != nil {
 		return
 	}
 	for _, k := range keys {
-		data, err := redisClient.Get(ctx, k).Result()
+		data, err := m.getClient().Get(ctx, k).Result()
 		if err == redis.Nil {
 			continue
 		} else if err != nil {
@@ -125,7 +142,7 @@ func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
 
 // Keys returns all the keys in the map.
 func (m *RedisSafeMap[V]) Keys() []string {
-	keys, err := redisClient.Keys(ctx, "*").Result()
+	keys, err := m.getClient().Keys(ctx, "*").Result()
 	if err != nil {
 		return []string{}
 	}
@@ -135,28 +152,27 @@ func (m *RedisSafeMap[V]) Keys() []string {
 // Clear removes all entries.
 func (m *RedisSafeMap[V]) Clear() {
 	// Clears the current database
-	redisClient.FlushDB(ctx)
+	m.getClient().FlushDB(ctx)
 }
 
 // UpdateExpireTime updates the expiration time for a key.
 func (m *RedisSafeMap[V]) UpdateExpireTime(key string, expireDuration time.Duration) bool {
 	// Check if key exists
-	exists := m.Exists(key)
-	if !exists {
+	if !m.Exists(key) {
 		return false
 	}
 	// Set expiration
-	redisClient.Expire(ctx, key, expireDuration)
+	m.getClient().Expire(ctx, key, expireDuration)
 	return true
 }
 
 // DeleteAllKeysStartingWith deletes all keys with the given prefix.
 func (m *RedisSafeMap[V]) DeleteAllKeysStartingWith(prefix string) {
-	keys, err := redisClient.Keys(ctx, prefix+"*").Result()
+	keys, err := m.getClient().Keys(ctx, prefix+"*").Result()
 	if err != nil || len(keys) == 0 {
 		return
 	}
-	redisClient.Del(ctx, keys...)
+	m.getClient().Del(ctx, keys...)
 }
 
 // ExpiredAndGet retrieves the value if it hasn't expired.
