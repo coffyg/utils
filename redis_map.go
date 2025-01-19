@@ -33,10 +33,9 @@ func NewRedisMapClient[V any](client *redis.Client) *RedisSafeMap[V] {
 		customClient: client,
 	}
 }
-func NewRedisMapClientPrefix[V any](client *redis.Client, prefix string) *RedisSafeMap[V] {
+func NewRedisMapClientPrefix[V any](prefix string) *RedisSafeMap[V] {
 	return &RedisSafeMap[V]{
-		customClient: client,
-		prefix:       prefix,
+		prefix: prefix,
 	}
 }
 
