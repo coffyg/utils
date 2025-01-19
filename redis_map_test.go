@@ -309,6 +309,7 @@ func TestSafeMapRedisRange(t *testing.T) {
 		}
 	}
 }
+
 func TestRedisMapClientDifferentDB(t *testing.T) {
 	// Create a new Redis client pointing to a different DB (e.g., DB = 1)
 	customClient := redis.NewClient(&redis.Options{
