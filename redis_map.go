@@ -33,6 +33,12 @@ func NewRedisMapClient[V any](client *redis.Client) *RedisSafeMap[V] {
 		customClient: client,
 	}
 }
+func NewRedisMapClientPrefix[V any](client *redis.Client, prefix string) *RedisSafeMap[V] {
+	return &RedisSafeMap[V]{
+		customClient: client,
+		prefix:       prefix,
+	}
+}
 
 // NewRedisMapClientWithPrefix returns a new Redis-backed map using a *custom* client
 // and a static prefix for all keys. This is optional but useful if you want to
