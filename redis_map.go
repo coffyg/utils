@@ -9,48 +9,62 @@ import (
 )
 
 var ctx = context.Background()
+
+// Global client for backward-compatibility.
 var redisClient *redis.Client
 
-// SetRedisClientForUtils sets the global Redis client to be used by all Redis maps.
+// SetRedisClientForUtils sets the global Redis client.
 func SetRedisClientForUtils(client *redis.Client) {
 	redisClient = client
 }
 
-// RedisSafeMap is a Redis-backed implementation of the same API as SafeMap.
+// RedisSafeMap is a Redis-backed map with an optional prefix, plus
+// a companion Redis Set that tracks our keys to allow fast Len/Keys/Range.
 type RedisSafeMap[V any] struct {
 	customClient *redis.Client
-	prefix       string // optional prefix to prepend to keys
+	prefix       string // optional prefix for keys in redis
+	setKey       string // the Redis set that keeps track of our keys
 }
 
-// NewRedisMap returns a new Redis-backed map that uses the global redisClient.
+// NewRedisMap uses the global redisClient with no prefix (API-compat).
 func NewRedisMap[V any]() *RedisSafeMap[V] {
 	return &RedisSafeMap[V]{}
 }
+func NewRedisMapPrefix[V any](prefix string) *RedisSafeMap[V] {
+	return &RedisSafeMap[V]{prefix: prefix, setKey: prefix + ":__keys"}
+}
 
-// NewRedisMapClient returns a new Redis-backed map using a *custom* client.
+// NewRedisMapClient uses a *custom* client with no prefix.
 func NewRedisMapClient[V any](client *redis.Client) *RedisSafeMap[V] {
 	return &RedisSafeMap[V]{
 		customClient: client,
 	}
 }
-func NewRedisMapClientPrefix[V any](prefix string) *RedisSafeMap[V] {
-	return &RedisSafeMap[V]{
-		prefix: prefix,
-	}
-}
 
-// NewRedisMapClientWithPrefix returns a new Redis-backed map using a *custom* client
-// and a static prefix for all keys. This is optional but useful if you want to
-// namespace or separate sets of keys in the same DB.
+// NewRedisMapClientWithPrefix uses a custom client and a prefix for keys.
 func NewRedisMapClientWithPrefix[V any](client *redis.Client, prefix string) *RedisSafeMap[V] {
+	// We'll also keep a companion set name: e.g. "myPrefix:__keys"
+	setName := prefix + ":__keys"
 	return &RedisSafeMap[V]{
 		customClient: client,
 		prefix:       prefix,
+		setKey:       setName,
 	}
 }
 
-// getClient returns the appropriate *redis.Client, preferring the customClient
-// if present, otherwise falling back to the global one.
+// If user never called the prefix-based constructor, we generate a fallback set key.
+func (m *RedisSafeMap[V]) getSetKey() string {
+	// If user gave us a prefix, use prefix:__keys.
+	if m.setKey != "" {
+		return m.setKey
+	}
+	// Otherwise, store all keys in a global set so that Len/Keys/Range are limited
+	// to the keys inserted by *this* map. We'll generate something stable per pointer:
+	// (In practice, you might prefer a random or user-specified set name.)
+	return "RedisSafeMap:" // or some unique ID
+}
+
+// getClient picks the custom or global client.
 func (m *RedisSafeMap[V]) getClient() *redis.Client {
 	if m.customClient != nil {
 		return m.customClient
@@ -58,15 +72,15 @@ func (m *RedisSafeMap[V]) getClient() *redis.Client {
 	return redisClient
 }
 
-// prependPrefix is a small helper to unify how we add prefixes to keys.
-func (m *RedisSafeMap[V]) prependPrefix(key string) string {
+// Build the actual Redis key: prefix + ":" + userKey
+func (m *RedisSafeMap[V]) buildKey(key string) string {
 	if m.prefix == "" {
 		return key
 	}
 	return m.prefix + ":" + key
 }
 
-// encodeValue and decodeValue handle (de)serialization of values to/from JSON.
+// marshal & unmarshal helpers
 func encodeValue[V any](v V) (string, error) {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -81,235 +95,316 @@ func decodeValue[V any](data string) (V, error) {
 	return v, err
 }
 
-// Get retrieves the value for the given key.
+// Get retrieves a value by key.
 func (m *RedisSafeMap[V]) Get(key string) (V, bool) {
 	var zero V
-	rkey := m.prependPrefix(key)
+	rkey := m.buildKey(key)
 
 	data, err := m.getClient().Get(ctx, rkey).Result()
 	if err == redis.Nil {
 		return zero, false
 	}
 	if err != nil {
-		// On error, treat as not found
 		return zero, false
 	}
+
 	val, err := decodeValue[V](data)
 	if err != nil {
-		// If decoding fails, treat as not found
 		return zero, false
 	}
 	return val, true
 }
 
-// Exists checks if the key exists in the map.
+// Exists checks if key is present (not expired).
 func (m *RedisSafeMap[V]) Exists(key string) bool {
-	rkey := m.prependPrefix(key)
+	rkey := m.buildKey(key)
 	count, err := m.getClient().Exists(ctx, rkey).Result()
-	if err != nil || count == 0 {
+	return (err == nil && count == 1)
+}
+
+// Set inserts/updates a value with no expiration.
+func (m *RedisSafeMap[V]) Set(key string, value V) {
+	rkey := m.buildKey(key)
+	data, err := encodeValue(value)
+	if err != nil {
+		return
+	}
+	// We'll pipeline the SET + SADD for better concurrency
+	c := m.getClient().Pipeline()
+	c.Set(ctx, rkey, data, 0)
+	c.SAdd(ctx, m.getSetKey(), key) // store the *unprefixed* key in the set
+	_, _ = c.Exec(ctx)
+}
+
+// SetWithExpireDuration inserts/updates with TTL.
+func (m *RedisSafeMap[V]) SetWithExpireDuration(key string, value V, expire time.Duration) {
+	rkey := m.buildKey(key)
+	data, err := encodeValue(value)
+	if err != nil {
+		return
+	}
+	// pipeline
+	c := m.getClient().Pipeline()
+	c.Set(ctx, rkey, data, expire)
+	c.SAdd(ctx, m.getSetKey(), key)
+	_, _ = c.Exec(ctx)
+}
+
+// Delete removes a key from redis and from our set
+func (m *RedisSafeMap[V]) Delete(key string) {
+	rkey := m.buildKey(key)
+	c := m.getClient().Pipeline()
+	c.Del(ctx, rkey)
+	c.SRem(ctx, m.getSetKey(), key)
+	_, _ = c.Exec(ctx)
+}
+
+// UpdateExpireTime extends or sets TTL for an existing key. If key does not exist, returns false.
+func (m *RedisSafeMap[V]) UpdateExpireTime(key string, expire time.Duration) bool {
+	rkey := m.buildKey(key)
+	// check if it exists
+	exists, err := m.getClient().Exists(ctx, rkey).Result()
+	if err != nil || exists == 0 {
 		return false
 	}
+	m.getClient().Expire(ctx, rkey, expire)
 	return true
 }
 
-// Set inserts or updates the value for the given key without expiration.
-func (m *RedisSafeMap[V]) Set(key string, value V) {
-	data, err := encodeValue(value)
-	if err != nil {
-		return
-	}
-	rkey := m.prependPrefix(key)
-	m.getClient().Set(ctx, rkey, data, 0)
-}
-
-// SetWithExpireDuration inserts or updates the value with an expiration duration.
-func (m *RedisSafeMap[V]) SetWithExpireDuration(key string, value V, expireDuration time.Duration) {
-	data, err := encodeValue(value)
-	if err != nil {
-		return
-	}
-	rkey := m.prependPrefix(key)
-	m.getClient().Set(ctx, rkey, data, expireDuration)
-}
-
-// Len returns the total number of entries (non-expired).
-// For performance, we use a SCAN-based approach instead of KEYS *.
-func (m *RedisSafeMap[V]) Len() int {
-	count := 0
-	// pattern: if prefix is set, scan only that prefix with wildcard
-	pattern := "*"
-	if m.prefix != "" {
-		pattern = m.prefix + ":*"
-	}
-
+// DeleteAllKeysStartingWith removes all keys whose *unprefixed* name starts with `prefixArg`.
+// (We still store the unprefixed key in our set. So we can filter easily.)
+func (m *RedisSafeMap[V]) DeleteAllKeysStartingWith(prefixArg string) {
 	client := m.getClient()
+
+	// We'll scan the set for matching keys, then delete them in a pipeline.
 	var cursor uint64
+	setKey := m.getSetKey()
+
 	for {
-		keys, cur, err := client.Scan(ctx, cursor, pattern, 1000).Result()
+		// sscan the *set* for keys that start with prefixArg
+		// The pattern "prefixArg*" matches the *raw/unprefixed* keys in the set.
+		keys, cur, err := client.SScan(ctx, setKey, cursor, prefixArg+"*", 300).Result()
 		if err != nil {
-			return count
+			break
 		}
-		count += len(keys)
+		if len(keys) > 0 {
+			pipe := client.Pipeline()
+			for _, k := range keys {
+				pipe.Del(ctx, m.buildKey(k))
+				pipe.SRem(ctx, setKey, k)
+			}
+			_, _ = pipe.Exec(ctx)
+		}
 		cursor = cur
 		if cursor == 0 {
 			break
 		}
 	}
-	return count
 }
 
-// Delete removes the entry for the given key.
-func (m *RedisSafeMap[V]) Delete(key string) {
-	rkey := m.prependPrefix(key)
-	m.getClient().Del(ctx, rkey)
+// ExpiredAndGet is basically just Get. If the key is expired, it's not found.
+func (m *RedisSafeMap[V]) ExpiredAndGet(key string) (V, bool) {
+	return m.Get(key)
 }
 
-// Range iterates over all entries. If f returns false, iteration stops.
-// Uses SCAN internally.
-func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
-	pattern := "*"
-	if m.prefix != "" {
-		pattern = m.prefix + ":*"
-	}
-
+// Clear removes *all* keys belonging to this map’s set from Redis.
+// If no prefix was set, it removes everything from our "global" set as well.
+func (m *RedisSafeMap[V]) Clear() {
 	client := m.getClient()
+	setKey := m.getSetKey()
+
+	// We'll just sscan all keys in the set, remove them, then empty the set.
+	var cursor uint64
+	for {
+		keys, cur, err := client.SScan(ctx, setKey, cursor, "*", 300).Result()
+		if err != nil {
+			break
+		}
+		if len(keys) > 0 {
+			pipe := client.Pipeline()
+			for _, k := range keys {
+				pipe.Del(ctx, m.buildKey(k))
+			}
+			// after we delete all, we can also SREM them from the set
+			pipe.SRem(ctx, setKey, keys)
+			_, _ = pipe.Exec(ctx)
+		}
+		cursor = cur
+		if cursor == 0 {
+			break
+		}
+	}
+}
+
+// Len returns how many *unexpired* keys are in our map.
+//
+// We do this by iterating all members of the set. For each chunk, we pipeline
+// GET or EXISTS calls. If a key doesn't exist (expired or manually deleted),
+// we remove it from the set.
+func (m *RedisSafeMap[V]) Len() int {
+	client := m.getClient()
+	setKey := m.getSetKey()
+
+	total := 0
+	var cursor uint64
+	for {
+		keys, cur, err := client.SScan(ctx, setKey, cursor, "*", 300).Result()
+		if err != nil {
+			break
+		}
+		if len(keys) == 0 {
+			cursor = cur
+			if cursor == 0 {
+				break
+			}
+			continue
+		}
+
+		// Pipeline an EXISTS for each key
+		pipe := client.Pipeline()
+		existsCmds := make([]*redis.IntCmd, len(keys))
+		for i, k := range keys {
+			existsCmds[i] = pipe.Exists(ctx, m.buildKey(k))
+		}
+		_, _ = pipe.Exec(ctx)
+
+		// Pipeline for removing stale
+		removePipe := client.Pipeline()
+		staleCount := 0
+		for i, k := range keys {
+			ex, _ := existsCmds[i].Result()
+			if ex > 0 {
+				// Key still exists
+				total++
+			} else {
+				// Key no longer exists, remove from set
+				removePipe.SRem(ctx, setKey, k)
+				staleCount++
+			}
+		}
+		if staleCount > 0 {
+			_, _ = removePipe.Exec(ctx)
+		}
+
+		cursor = cur
+		if cursor == 0 {
+			break
+		}
+	}
+	return total
+}
+
+// Keys returns a slice of all *unexpired* keys.
+func (m *RedisSafeMap[V]) Keys() []string {
+	client := m.getClient()
+	setKey := m.getSetKey()
+
+	var out []string
+	var cursor uint64
+	for {
+		keys, cur, err := client.SScan(ctx, setKey, cursor, "*", 300).Result()
+		if err != nil {
+			break
+		}
+		if len(keys) == 0 {
+			cursor = cur
+			if cursor == 0 {
+				break
+			}
+			continue
+		}
+
+		// Pipeline an EXISTS for each
+		pipe := client.Pipeline()
+		existsCmds := make([]*redis.IntCmd, len(keys))
+		for i, k := range keys {
+			existsCmds[i] = pipe.Exists(ctx, m.buildKey(k))
+		}
+		_, _ = pipe.Exec(ctx)
+
+		// Another pipeline to remove stales
+		removePipe := client.Pipeline()
+		for i, k := range keys {
+			ex, _ := existsCmds[i].Result()
+			if ex > 0 {
+				// Still valid
+				out = append(out, k)
+			} else {
+				// stale, remove from set
+				removePipe.SRem(ctx, setKey, k)
+			}
+		}
+		_, _ = removePipe.Exec(ctx)
+
+		cursor = cur
+		if cursor == 0 {
+			break
+		}
+	}
+	return out
+}
+
+// Range iterates over each *unexpired* key-value pair. If f returns false, iteration stops.
+//
+// Implementation: we sscan the set in chunks, pipeline GET calls, remove expired keys from the set.
+func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
+	client := m.getClient()
+	setKey := m.getSetKey()
 
 	var cursor uint64
 	for {
-		keys, cur, err := client.Scan(ctx, cursor, pattern, 1000).Result()
+		keys, cur, err := client.SScan(ctx, setKey, cursor, "*", 300).Result()
 		if err != nil {
-			return
+			break
 		}
-		for _, k := range keys {
-			data, err := client.Get(ctx, k).Result()
+		if len(keys) == 0 {
+			cursor = cur
+			if cursor == 0 {
+				break
+			}
+			continue
+		}
+
+		// We'll pipeline GET calls for each key
+		pipe := client.Pipeline()
+		getCmds := make([]*redis.StringCmd, len(keys))
+		for i, k := range keys {
+			getCmds[i] = pipe.Get(ctx, m.buildKey(k))
+		}
+		_, _ = pipe.Exec(ctx)
+
+		// Another pipeline to remove stales
+		removePipe := client.Pipeline()
+
+		// Process the results
+		for i, k := range keys {
+			data, err := getCmds[i].Result()
 			if err == redis.Nil {
+				// stale (expired or never existed)
+				removePipe.SRem(ctx, setKey, k)
 				continue
 			}
 			if err != nil {
+				// some transient redis error => skip
 				continue
 			}
+
 			val, err := decodeValue[V](data)
 			if err != nil {
+				// skip decoding error
 				continue
 			}
-			// We strip the prefix from `k` before passing to user callback
-			userKey := k
-			if m.prefix != "" {
-				userKey = userKey[len(m.prefix)+1:] // remove "prefix:"
-			}
-			if !f(userKey, val) {
+			// If f returns false, stop iteration
+			if !f(k, val) {
+				_, _ = removePipe.Exec(ctx)
 				return
 			}
 		}
+		_, _ = removePipe.Exec(ctx)
+
 		cursor = cur
 		if cursor == 0 {
 			break
 		}
 	}
-}
-
-// Keys returns all the keys in the map (non-expired).
-// Uses SCAN internally.
-func (m *RedisSafeMap[V]) Keys() []string {
-	pattern := "*"
-	if m.prefix != "" {
-		pattern = m.prefix + ":*"
-	}
-
-	client := m.getClient()
-	var cursor uint64
-	var allKeys []string
-
-	for {
-		keys, cur, err := client.Scan(ctx, cursor, pattern, 1000).Result()
-		if err != nil {
-			break
-		}
-		for _, k := range keys {
-			if m.prefix != "" {
-				// strip prefix
-				k = k[len(m.prefix)+1:]
-			}
-			allKeys = append(allKeys, k)
-		}
-		cursor = cur
-		if cursor == 0 {
-			break
-		}
-	}
-	return allKeys
-}
-
-// Clear removes all entries from the current DB for this prefix ONLY if prefix is set.
-// If prefix is NOT set, it flushes the entire DB to remain consistent with older
-// behavior. Adjust as needed if you prefer scanning for all keys in that case too.
-func (m *RedisSafeMap[V]) Clear() {
-	client := m.getClient()
-	if m.prefix == "" {
-		// Clears the current database
-		client.FlushDB(ctx)
-		return
-	}
-	// If a prefix is specified, only delete those keys
-	pattern := m.prefix + ":*"
-	var cursor uint64
-	for {
-		keys, cur, err := client.Scan(ctx, cursor, pattern, 1000).Result()
-		if err != nil {
-			return
-		}
-		if len(keys) > 0 {
-			client.Del(ctx, keys...)
-		}
-		cursor = cur
-		if cursor == 0 {
-			break
-		}
-	}
-}
-
-// UpdateExpireTime updates the expiration time for a key.
-func (m *RedisSafeMap[V]) UpdateExpireTime(key string, expireDuration time.Duration) bool {
-	rkey := m.prependPrefix(key)
-	// Check if key exists
-	count, err := m.getClient().Exists(ctx, rkey).Result()
-	if err != nil || count == 0 {
-		return false
-	}
-	// Set expiration
-	m.getClient().Expire(ctx, rkey, expireDuration)
-	return true
-}
-
-// DeleteAllKeysStartingWith deletes all keys with the given prefix (in addition to the static prefix, if set).
-func (m *RedisSafeMap[V]) DeleteAllKeysStartingWith(prefix string) {
-	client := m.getClient()
-	// Combine the map prefix with the user prefix
-	actualPattern := prefix
-	if m.prefix != "" {
-		actualPattern = m.prefix + ":" + prefix
-	}
-	// SCAN to find all matching
-	var cursor uint64
-	for {
-		keys, cur, err := client.Scan(ctx, cursor, actualPattern+"*", 1000).Result()
-		if err != nil || len(keys) == 0 {
-			if err != nil {
-				// If there's an error, break out
-				break
-			}
-		} else {
-			client.Del(ctx, keys...)
-		}
-		cursor = cur
-		if cursor == 0 {
-			break
-		}
-	}
-}
-
-// ExpiredAndGet retrieves the value if it hasn't expired.
-// In Redis, if the key is expired, it won't be found, so this is just a Get.
-func (m *RedisSafeMap[V]) ExpiredAndGet(key string) (V, bool) {
-	return m.Get(key)
 }
