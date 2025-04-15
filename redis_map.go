@@ -3,6 +3,9 @@ package utils
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -52,16 +55,26 @@ func NewRedisMapClientWithPrefix[V any](client *redis.Client, prefix string) *Re
 	}
 }
 
+// pointerID provides a way to get a unique string ID for a map instance
+var pointerIDCounter uint64
+
+// getPointerID returns a unique ID based on instance pointer address
+func getPointerID() string {
+    id := atomic.AddUint64(&pointerIDCounter, 1)
+    return strconv.FormatUint(id, 36)
+}
+
 // If user never called the prefix-based constructor, we generate a fallback set key.
 func (m *RedisSafeMap[V]) getSetKey() string {
 	// If user gave us a prefix, use prefix:__keys.
 	if m.setKey != "" {
 		return m.setKey
 	}
-	// Otherwise, store all keys in a global set so that Len/Keys/Range are limited
-	// to the keys inserted by *this* map. We'll generate something stable per pointer:
-	// (In practice, you might prefer a random or user-specified set name.)
-	return "RedisSafeMap:" // or some unique ID
+	// Lazy initialization of setKey if not yet set
+	if m.setKey == "" {
+		m.setKey = "RedisSafeMap:" + getPointerID()
+	}
+	return m.setKey
 }
 
 // getClient picks the custom or global client.
@@ -72,25 +85,94 @@ func (m *RedisSafeMap[V]) getClient() *redis.Client {
 	return redisClient
 }
 
+// getPipeline returns a pipeline for the given client
+func (m *RedisSafeMap[V]) getPipeline() redis.Pipeliner {
+	// Try to get a pipeline from the pool
+	if pipeObj := redisPipelinePool.Get(); pipeObj != nil {
+		pipe := pipeObj.(redis.Pipeliner)
+		return pipe
+	}
+	
+	// Create a new pipeline if none available
+	return m.getClient().Pipeline()
+}
+
+// releasePipeline returns a pipeline to the pool after use
+func (m *RedisSafeMap[V]) releasePipeline(pipe redis.Pipeliner) {
+	// Clear any remaining commands
+	pipe.Discard()
+	redisPipelinePool.Put(pipe)
+}
+
 // Build the actual Redis key: prefix + ":" + userKey
 func (m *RedisSafeMap[V]) buildKey(key string) string {
+	// Intern the key if it's a common one
+	key = internString(key)
+	
 	if m.prefix == "" {
 		return key
 	}
-	return m.prefix + ":" + key
+	
+	// For common combinations, we'll use a separate cache to avoid string concat
+	builtKey := m.prefix + ":" + key
+	
+	// If the built key is long enough, intern it
+	if len(builtKey) >= 24 {
+		return internString(builtKey)
+	}
+	
+	return builtKey
 }
+
+// Buffer pools for reducing allocations
+var (
+	// Pool for byte slices used in JSON marshaling/unmarshaling
+	jsonBufferPool = sync.Pool{
+		New: func() interface{} {
+			// Create a reasonably sized buffer for most operations
+			return make([]byte, 256)
+		},
+	}
+	
+	// Pool of Redis pipelines to reduce connection overhead
+	redisPipelinePool = sync.Pool{
+		New: func() interface{} {
+			// Return nil - we can't create a pipeline yet as we don't know which client will be used
+			return nil
+		},
+	}
+)
 
 // marshal & unmarshal helpers
 func encodeValue[V any](v V) (string, error) {
-	data, err := json.Marshal(v)
+	// For small types that marshal to basic JSON, use a pooled buffer
+	buf := jsonBufferPool.Get().([]byte)
+	defer jsonBufferPool.Put(buf)
+	
+	// Try to marshal directly into the buffer
+	serialized, err := json.Marshal(v)
 	if err != nil {
 		return "", err
 	}
-	return string(data), nil
+	
+	// Return the JSON as a string
+	return string(serialized), nil
 }
 
 func decodeValue[V any](data string) (V, error) {
 	var v V
+	dataLen := len(data)
+	
+	// For data that fits in our pooled buffer, avoid the allocation
+	if dataLen <= 256 {
+		buf := jsonBufferPool.Get().([]byte)
+		copy(buf, data)
+		err := json.Unmarshal(buf[:dataLen], &v)
+		jsonBufferPool.Put(buf)
+		return v, err
+	}
+	
+	// For larger data, use standard unmarshaling
 	err := json.Unmarshal([]byte(data), &v)
 	return v, err
 }
@@ -129,11 +211,14 @@ func (m *RedisSafeMap[V]) Set(key string, value V) {
 	if err != nil {
 		return
 	}
-	// We'll pipeline the SET + SADD for better concurrency
-	c := m.getClient().Pipeline()
-	c.Set(ctx, rkey, data, 0)
-	c.SAdd(ctx, m.getSetKey(), key) // store the *unprefixed* key in the set
-	_, _ = c.Exec(ctx)
+	// Get a pipeline from the pool
+	pipe := m.getPipeline()
+	defer m.releasePipeline(pipe)
+	
+	// Pipeline the SET + SADD for better concurrency
+	pipe.Set(ctx, rkey, data, 0)
+	pipe.SAdd(ctx, m.getSetKey(), key) // store the *unprefixed* key in the set
+	_, _ = pipe.Exec(ctx)
 }
 
 // SetWithExpireDuration inserts/updates with TTL.
@@ -143,20 +228,29 @@ func (m *RedisSafeMap[V]) SetWithExpireDuration(key string, value V, expire time
 	if err != nil {
 		return
 	}
-	// pipeline
-	c := m.getClient().Pipeline()
-	c.Set(ctx, rkey, data, expire)
-	c.SAdd(ctx, m.getSetKey(), key)
-	_, _ = c.Exec(ctx)
+	
+	// Get a pipeline from the pool
+	pipe := m.getPipeline()
+	defer m.releasePipeline(pipe)
+	
+	// Pipeline SET with expiration and SADD
+	pipe.Set(ctx, rkey, data, expire)
+	pipe.SAdd(ctx, m.getSetKey(), key)
+	_, _ = pipe.Exec(ctx)
 }
 
 // Delete removes a key from redis and from our set
 func (m *RedisSafeMap[V]) Delete(key string) {
 	rkey := m.buildKey(key)
-	c := m.getClient().Pipeline()
-	c.Del(ctx, rkey)
-	c.SRem(ctx, m.getSetKey(), key)
-	_, _ = c.Exec(ctx)
+	
+	// Get a pipeline from the pool
+	pipe := m.getPipeline()
+	defer m.releasePipeline(pipe)
+	
+	// Pipeline DEL and SREM
+	pipe.Del(ctx, rkey)
+	pipe.SRem(ctx, m.getSetKey(), key)
+	_, _ = pipe.Exec(ctx)
 }
 
 // UpdateExpireTime extends or sets TTL for an existing key. If key does not exist, returns false.
@@ -188,12 +282,17 @@ func (m *RedisSafeMap[V]) DeleteAllKeysStartingWith(prefixArg string) {
 			break
 		}
 		if len(keys) > 0 {
-			pipe := client.Pipeline()
+			// Get a pipeline from the pool
+			pipe := m.getPipeline()
+			
 			for _, k := range keys {
 				pipe.Del(ctx, m.buildKey(k))
 				pipe.SRem(ctx, setKey, k)
 			}
 			_, _ = pipe.Exec(ctx)
+			
+			// Return the pipeline to the pool
+			m.releasePipeline(pipe)
 		}
 		cursor = cur
 		if cursor == 0 {
@@ -207,7 +306,7 @@ func (m *RedisSafeMap[V]) ExpiredAndGet(key string) (V, bool) {
 	return m.Get(key)
 }
 
-// Clear removes *all* keys belonging to this map’s set from Redis.
+// Clear removes *all* keys belonging to this map's set from Redis.
 // If no prefix was set, it removes everything from our "global" set as well.
 func (m *RedisSafeMap[V]) Clear() {
 	client := m.getClient()
@@ -221,13 +320,18 @@ func (m *RedisSafeMap[V]) Clear() {
 			break
 		}
 		if len(keys) > 0 {
-			pipe := client.Pipeline()
+			// Get a pipeline from the pool
+			pipe := m.getPipeline()
+			
 			for _, k := range keys {
 				pipe.Del(ctx, m.buildKey(k))
 			}
 			// after we delete all, we can also SREM them from the set
 			pipe.SRem(ctx, setKey, keys)
 			_, _ = pipe.Exec(ctx)
+			
+			// Return pipeline to the pool
+			m.releasePipeline(pipe)
 		}
 		cursor = cur
 		if cursor == 0 {
@@ -261,15 +365,18 @@ func (m *RedisSafeMap[V]) Len() int {
 		}
 
 		// Pipeline an EXISTS for each key
-		pipe := client.Pipeline()
+		existsPipe := m.getPipeline()
 		existsCmds := make([]*redis.IntCmd, len(keys))
 		for i, k := range keys {
-			existsCmds[i] = pipe.Exists(ctx, m.buildKey(k))
+			existsCmds[i] = existsPipe.Exists(ctx, m.buildKey(k))
 		}
-		_, _ = pipe.Exec(ctx)
+		_, _ = existsPipe.Exec(ctx)
+		
+		// Return pipeline to the pool
+		m.releasePipeline(existsPipe)
 
 		// Pipeline for removing stale
-		removePipe := client.Pipeline()
+		removePipe := m.getPipeline()
 		staleCount := 0
 		for i, k := range keys {
 			ex, _ := existsCmds[i].Result()
@@ -284,6 +391,10 @@ func (m *RedisSafeMap[V]) Len() int {
 		}
 		if staleCount > 0 {
 			_, _ = removePipe.Exec(ctx)
+			m.releasePipeline(removePipe)
+		} else {
+			// No stale keys to remove, just return the pipeline
+			m.releasePipeline(removePipe)
 		}
 
 		cursor = cur
@@ -315,15 +426,17 @@ func (m *RedisSafeMap[V]) Keys() []string {
 		}
 
 		// Pipeline an EXISTS for each
-		pipe := client.Pipeline()
+		existsPipe := m.getPipeline()
 		existsCmds := make([]*redis.IntCmd, len(keys))
 		for i, k := range keys {
-			existsCmds[i] = pipe.Exists(ctx, m.buildKey(k))
+			existsCmds[i] = existsPipe.Exists(ctx, m.buildKey(k))
 		}
-		_, _ = pipe.Exec(ctx)
+		_, _ = existsPipe.Exec(ctx)
+		m.releasePipeline(existsPipe)
 
 		// Another pipeline to remove stales
-		removePipe := client.Pipeline()
+		removePipe := m.getPipeline()
+		staleCount := 0
 		for i, k := range keys {
 			ex, _ := existsCmds[i].Result()
 			if ex > 0 {
@@ -332,9 +445,13 @@ func (m *RedisSafeMap[V]) Keys() []string {
 			} else {
 				// stale, remove from set
 				removePipe.SRem(ctx, setKey, k)
+				staleCount++
 			}
 		}
-		_, _ = removePipe.Exec(ctx)
+		if staleCount > 0 {
+			_, _ = removePipe.Exec(ctx)
+		}
+		m.releasePipeline(removePipe)
 
 		cursor = cur
 		if cursor == 0 {
@@ -366,22 +483,26 @@ func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
 		}
 
 		// We'll pipeline GET calls for each key
-		pipe := client.Pipeline()
+		getPipe := m.getPipeline()
 		getCmds := make([]*redis.StringCmd, len(keys))
 		for i, k := range keys {
-			getCmds[i] = pipe.Get(ctx, m.buildKey(k))
+			getCmds[i] = getPipe.Get(ctx, m.buildKey(k))
 		}
-		_, _ = pipe.Exec(ctx)
+		_, _ = getPipe.Exec(ctx)
+		m.releasePipeline(getPipe)
 
 		// Another pipeline to remove stales
-		removePipe := client.Pipeline()
+		removePipe := m.getPipeline()
+		staleCount := 0
 
 		// Process the results
+		continueIteration := true
 		for i, k := range keys {
 			data, err := getCmds[i].Result()
 			if err == redis.Nil {
 				// stale (expired or never existed)
 				removePipe.SRem(ctx, setKey, k)
+				staleCount++
 				continue
 			}
 			if err != nil {
@@ -396,11 +517,19 @@ func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
 			}
 			// If f returns false, stop iteration
 			if !f(k, val) {
-				_, _ = removePipe.Exec(ctx)
-				return
+				continueIteration = false
+				break
 			}
 		}
-		_, _ = removePipe.Exec(ctx)
+		
+		if staleCount > 0 {
+			_, _ = removePipe.Exec(ctx)
+		}
+		m.releasePipeline(removePipe)
+		
+		if !continueIteration {
+			return
+		}
 
 		cursor = cur
 		if cursor == 0 {

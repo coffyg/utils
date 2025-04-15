@@ -11,6 +11,43 @@ import (
 // cacheLine is used to pad structs to prevent false sharing
 type cacheLine [64]byte
 
+// stringInternPool for reducing string allocations in maps
+var stringInternPool sync.Map
+
+// commonMapKeys contains frequently used keys for string interning
+var commonMapKeys = []string{
+	"id", "name", "title", "description", "type", "status", "value",
+	"count", "total", "price", "cost", "date", "time", "timestamp",
+	"created_at", "updated_at", "deleted_at", "user_id", "user",
+	"cache", "token", "access", "refresh", "session", "auth", "key",
+	"config", "settings", "options", "data", "result", "error", "success",
+}
+
+// internString returns an interned version of the string to reduce memory usage
+func internString(s string) string {
+	// Check if string is already interned
+	if interned, ok := stringInternPool.Load(s); ok {
+		return interned.(string)
+	}
+	
+	// If the string is short (under 24 bytes), it's not worth interning
+	// because the sync.Map overhead would be more than the saved memory
+	if len(s) < 24 {
+		return s
+	}
+	
+	// Store the string in the pool for future use
+	stringInternPool.Store(s, s)
+	return s
+}
+
+func init() {
+	// Pre-intern common map keys
+	for _, key := range commonMapKeys {
+		stringInternPool.Store(key, key)
+	}
+}
+
 type mapEntry[V any] struct {
 	value      atomic.Value // Stores V
 	expireTime int64        // Unix timestamp in nanoseconds (0 means no expiration)
@@ -76,14 +113,43 @@ func NewSafeMapWithShardCount[V any](shardCount int) *SafeMap[V] {
 func fnv32(key string) uint32 {
 	var hash uint32 = 2166136261
 	const prime32 = 16777619
-	for i := 0; i < len(key); i++ {
+	
+	// Process bytes in chunks of 8 for better performance
+	length := len(key)
+	i := 0
+	
+	// Process 8 bytes at a time
+	for ; i+8 <= length; i += 8 {
+		hash ^= uint32(key[i])
+		hash *= prime32
+		hash ^= uint32(key[i+1])
+		hash *= prime32
+		hash ^= uint32(key[i+2])
+		hash *= prime32
+		hash ^= uint32(key[i+3])
+		hash *= prime32
+		hash ^= uint32(key[i+4])
+		hash *= prime32
+		hash ^= uint32(key[i+5])
+		hash *= prime32
+		hash ^= uint32(key[i+6])
+		hash *= prime32
+		hash ^= uint32(key[i+7])
+		hash *= prime32
+	}
+	
+	// Process remaining bytes
+	for ; i < length; i++ {
 		hash ^= uint32(key[i])
 		hash *= prime32
 	}
+	
 	return hash
 }
 
 func (sm *SafeMap[V]) getShard(key string) *mapShard[V] {
+	// Intern the key if it's a common pattern or long
+	key = internString(key)
 	hash := fnv32(key)
 	// Use bitwise AND with modMask instead of modulo
 	return sm.shards[hash&sm.modMask]

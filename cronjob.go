@@ -106,21 +106,74 @@ func (m *CronManager) runJob(cronJob *CronJob) {
 		}
 	}()
 
+	// Create a new channel each time - pooling channels is risky because of the close operation
 	done := make(chan struct{})
+	
 	go func() {
 		cronJob.Action()
 		close(done)
 	}()
 
+	// Use a pooled timer instead of time.After to avoid allocations
+	timer := getTimer(cronJob.Interval)
+	defer releaseTimer(timer)
+	
 	select {
 	case <-done:
 		m.logger.Debug().Msgf("[cron|%s|%s] completed", cronJob.Name, cronJob.Interval)
-	case <-time.After(cronJob.Interval):
+	case <-timer.C:
 		m.logger.Error().Msgf("[cron|%s|%s] timed out", cronJob.Name, cronJob.Interval)
 	}
 }
 
+// timerPool reuses timer objects to reduce GC pressure
+var timerPool = sync.Pool{
+	New: func() interface{} {
+		return time.NewTimer(time.Hour)
+	},
+}
+
+// getTimer returns a timer from the pool or creates a new one
+func getTimer(d time.Duration) *time.Timer {
+	timer := timerPool.Get().(*time.Timer)
+	
+	// Stop the timer if it's running
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	
+	// Reset to the requested duration
+	timer.Reset(d)
+	return timer
+}
+
+// releaseTimer returns a timer to the pool
+func releaseTimer(t *time.Timer) {
+	if t == nil {
+		return
+	}
+	
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	
+	timerPool.Put(t)
+}
+
 func (m *CronManager) dispatcher() {
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			releaseTimer(timer)
+		}
+	}()
+	
 	for {
 		m.lock.Lock()
 		if len(m.jobHeap) == 0 {
@@ -150,22 +203,26 @@ func (m *CronManager) dispatcher() {
 
 			m.runJob(nextJob)
 
-			// Reschedule the job.
+			// Reschedule the job with more accurate timing
 			nextJob.nextRun = time.Now().Add(nextJob.Interval)
 
 			m.lock.Lock()
 			heap.Push(&m.jobHeap, nextJob)
 			m.lock.Unlock()
 		} else {
-			timer := time.NewTimer(delay)
+			// Reuse timer to avoid allocations
+			if timer == nil {
+				timer = getTimer(delay)
+			} else {
+				timer.Reset(delay)
+			}
+			
 			select {
 			case <-timer.C:
 				// Time to check the jobs again.
 			case <-m.stopChan:
-				timer.Stop()
 				return
 			case <-m.wakeUpChan:
-				timer.Stop()
 				// New job added, continue
 			}
 		}

@@ -14,6 +14,9 @@ type Monitor struct {
 	onMetricsFunc func(Metrics)
 	startOnce     sync.Once
 	stopOnce      sync.Once
+	// Cached values for better performance
+	lastMetrics   Metrics
+	metricsLock   sync.RWMutex
 }
 
 type Metrics struct {
@@ -64,26 +67,83 @@ func (m *Monitor) Stop() {
 	})
 }
 
-func (m *Monitor) collectMetrics() Metrics {
-	numFDs := countOpenFileDescriptors()
-	numGoroutines := runtime.NumGoroutine()
-	return Metrics{
-		OpenFileDescriptors: numFDs,
-		NumGoroutines:       numGoroutines,
-		Timestamp:           time.Now(),
+// CleanupFDCache closes the file descriptor directory cache.
+// Should be called during program shutdown.
+func CleanupFDCache() {
+	if fdDirCache.dir != nil {
+		fdDirCache.dir.Close()
+		fdDirCache.dir = nil
 	}
 }
 
+func (m *Monitor) collectMetrics() Metrics {
+	now := time.Now()
+	
+	// Check if we've collected metrics less than 100ms ago
+	m.metricsLock.RLock()
+	lastMetrics := m.lastMetrics
+	m.metricsLock.RUnlock()
+	
+	if !lastMetrics.Timestamp.IsZero() && now.Sub(lastMetrics.Timestamp) < 100*time.Millisecond {
+		// Use cached values but update timestamp
+		return Metrics{
+			OpenFileDescriptors: lastMetrics.OpenFileDescriptors,
+			NumGoroutines:       lastMetrics.NumGoroutines,
+			Timestamp:           now,
+		}
+	}
+	
+	// Collect fresh metrics
+	numFDs := countOpenFileDescriptors()
+	numGoroutines := runtime.NumGoroutine()
+	
+	metrics := Metrics{
+		OpenFileDescriptors: numFDs,
+		NumGoroutines:       numGoroutines,
+		Timestamp:           now,
+	}
+	
+	// Cache the metrics for future requests
+	m.metricsLock.Lock()
+	m.lastMetrics = metrics
+	m.metricsLock.Unlock()
+	
+	return metrics
+}
+
+// fdDirCache holds the open fd directory to avoid reopening it repeatedly
+var fdDirCache struct {
+	dir     *os.File
+	once    sync.Once
+	dirErr  error
+	readErr error
+}
+
 func countOpenFileDescriptors() int {
-	dir, err := os.Open("/proc/self/fd")
-	if err != nil {
+	// Use a cached directory handle for better performance
+	fdDirCache.once.Do(func() {
+		fdDirCache.dir, fdDirCache.dirErr = os.Open("/proc/self/fd")
+		if fdDirCache.dirErr != nil {
+			return
+		}
+	})
+
+	if fdDirCache.dirErr != nil {
 		return -1 // Return -1 to indicate an error
 	}
-	defer dir.Close()
 
-	names, err := dir.Readdirnames(-1)
+	// Rewind directory to beginning
+	_, err := fdDirCache.dir.Seek(0, 0)
 	if err != nil {
 		return -1
 	}
-	return len(names)
+
+	// Read all directory entries
+	names, err := fdDirCache.dir.Readdirnames(-1)
+	if err != nil {
+		return -1
+	}
+	
+	// Return count minus 1 for the directory itself
+	return len(names) - 1
 }

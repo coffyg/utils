@@ -59,3 +59,5 @@ glide.lock
 # Temporary files
 *.session
 tags
+*.txt
+*.md

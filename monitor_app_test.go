@@ -55,6 +55,26 @@ func TestCountOpenFileDescriptors(t *testing.T) {
 
 func BenchmarkMonitor_CollectMetrics(b *testing.B) {
 	monitor := &Monitor{}
+	b.ResetTimer()
+	
+	for i := 0; i < b.N; i++ {
+		_ = monitor.collectMetrics()
+	}
+}
+
+func BenchmarkCountOpenFileDescriptors(b *testing.B) {
+	b.ResetTimer()
+	
+	for i := 0; i < b.N; i++ {
+		_ = countOpenFileDescriptors()
+	}
+}
+
+// Test multiple rapid requests for metrics
+func BenchmarkMonitor_RapidMetricsRequests(b *testing.B) {
+	monitor := NewMonitor(1*time.Second, func(metrics Metrics) {})
+	
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = monitor.collectMetrics()
 	}
