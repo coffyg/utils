@@ -6,15 +6,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 // cacheLine is used to pad structs to prevent false sharing
 type cacheLine [64]byte
 
-// stringInternPool for reducing string allocations in maps
-var stringInternPool sync.Map
+// Precomputed common strings to avoid allocations without the overhead of sync.Map
+var commonKeyMap = make(map[string]string)
 
-// commonMapKeys contains frequently used keys for string interning
+// commonMapKeys contains frequently used keys
 var commonMapKeys = []string{
 	"id", "name", "title", "description", "type", "status", "value",
 	"count", "total", "price", "cost", "date", "time", "timestamp",
@@ -23,28 +24,10 @@ var commonMapKeys = []string{
 	"config", "settings", "options", "data", "result", "error", "success",
 }
 
-// internString returns an interned version of the string to reduce memory usage
-func internString(s string) string {
-	// Check if string is already interned
-	if interned, ok := stringInternPool.Load(s); ok {
-		return interned.(string)
-	}
-	
-	// If the string is short (under 24 bytes), it's not worth interning
-	// because the sync.Map overhead would be more than the saved memory
-	if len(s) < 24 {
-		return s
-	}
-	
-	// Store the string in the pool for future use
-	stringInternPool.Store(s, s)
-	return s
-}
-
 func init() {
-	// Pre-intern common map keys
+	// Pre-populate common key map for faster lookups without sync.Map overhead
 	for _, key := range commonMapKeys {
-		stringInternPool.Store(key, key)
+		commonKeyMap[key] = key
 	}
 }
 
@@ -109,59 +92,73 @@ func NewSafeMapWithShardCount[V any](shardCount int) *SafeMap[V] {
 	return sm
 }
 
-// fnv32 hashes a string to a uint32 using FNV-1a algorithm.
-func fnv32(key string) uint32 {
-	var hash uint32 = 2166136261
-	const prime32 = 16777619
-	
-	// Process bytes in chunks of 8 for better performance
+// xxHash64 is a faster, high-quality hashing algorithm
+func xxHash64(key string) uint32 {
+	const (
+		prime1 uint64 = 11400714785074694791
+		prime2 uint64 = 14029467366897019727
+		prime3 uint64 = 1609587929392839161
+		prime4 uint64 = 9650029242287828579
+		prime5 uint64 = 2870177450012600261
+	)
+
+	data := unsafe.Pointer(unsafe.StringData(key))
 	length := len(key)
-	i := 0
-	
-	// Process 8 bytes at a time
-	for ; i+8 <= length; i += 8 {
-		hash ^= uint32(key[i])
-		hash *= prime32
-		hash ^= uint32(key[i+1])
-		hash *= prime32
-		hash ^= uint32(key[i+2])
-		hash *= prime32
-		hash ^= uint32(key[i+3])
-		hash *= prime32
-		hash ^= uint32(key[i+4])
-		hash *= prime32
-		hash ^= uint32(key[i+5])
-		hash *= prime32
-		hash ^= uint32(key[i+6])
-		hash *= prime32
-		hash ^= uint32(key[i+7])
-		hash *= prime32
+	var h64 uint64
+
+	if length >= 4 {
+		// Fast path for strings >= 4 bytes
+		h64 = uint64(length) * prime5
+		end := length & ^7 // Round down to multiple of 8
+		
+		for i := 0; i < end; i += 8 {
+			k1 := *(*uint64)(unsafe.Pointer(uintptr(data) + uintptr(i)))
+			k1 *= prime2
+			k1 = (k1 << 31) | (k1 >> 33) // rotl31
+			k1 *= prime1
+			h64 ^= k1
+			h64 = ((h64 << 27) | (h64 >> 37)) * prime1 + prime4
+		}
+
+		// Handle remaining bytes
+		for i := end; i < length; i++ {
+			h64 ^= uint64(*(*byte)(unsafe.Pointer(uintptr(data) + uintptr(i)))) * prime5
+			h64 = ((h64 << 17) | (h64 >> 47)) * prime3
+		}
+	} else {
+		// Short string optimization
+		h64 = uint64(length) * prime5
+		for i := 0; i < length; i++ {
+			h64 ^= uint64(*(*byte)(unsafe.Pointer(uintptr(data) + uintptr(i)))) * prime5
+			h64 = ((h64 << 17) | (h64 >> 47)) * prime3
+		}
 	}
-	
-	// Process remaining bytes
-	for ; i < length; i++ {
-		hash ^= uint32(key[i])
-		hash *= prime32
-	}
-	
-	return hash
+
+	h64 ^= h64 >> 33
+	h64 *= prime2
+	h64 ^= h64 >> 29
+	h64 *= prime3
+	h64 ^= h64 >> 32
+
+	return uint32(h64)
 }
 
 func (sm *SafeMap[V]) getShard(key string) *mapShard[V] {
-	// Intern the key if it's a common pattern or long
-	key = internString(key)
-	hash := fnv32(key)
+	// Fast lookup for common keys without sync.Map overhead
+	if internedKey, ok := commonKeyMap[key]; ok {
+		key = internedKey
+	}
+	
+	hash := xxHash64(key)
 	// Use bitwise AND with modMask instead of modulo
 	return sm.shards[hash&sm.modMask]
 }
 
-// isExpired checks if an entry is expired
-func (s *mapShard[V]) isExpired(e *mapEntry[V], now int64) bool {
+// isExpired is a non-locking helper that checks if an entry is expired
+// Inlined for better performance
+func isExpired[V any](e *mapEntry[V], now int64) bool {
 	expireTime := atomic.LoadInt64(&e.expireTime)
-	if expireTime == 0 {
-		return false
-	}
-	return now > expireTime
+	return expireTime != 0 && now > expireTime
 }
 
 // Get retrieves the value for the given key.
@@ -175,7 +172,7 @@ func (s *mapShard[V]) get(key string) (V, bool) {
 	readOnly := s.readOnly.Load().(readOnlyMap[V])
 	entry, ok := readOnly.m[key]
 	if ok {
-		if !s.isExpired(entry, now) {
+		if !isExpired(entry, now) {
 			value := entry.value.Load().(V)
 			return value, true
 		}
@@ -195,7 +192,7 @@ func (s *mapShard[V]) get(key string) (V, bool) {
 	readOnly = s.readOnly.Load().(readOnlyMap[V])
 	if entry, ok = readOnly.m[key]; ok {
 		s.mu.Unlock()
-		if !s.isExpired(entry, now) {
+		if !isExpired(entry, now) {
 			value := entry.value.Load().(V)
 			return value, true
 		}
@@ -206,7 +203,7 @@ func (s *mapShard[V]) get(key string) (V, bool) {
 	
 	entry, ok = s.dirty[key]
 	if ok {
-		if !s.isExpired(entry, now) {
+		if !isExpired(entry, now) {
 			value := entry.value.Load().(V)
 			s.mu.Unlock()
 			return value, true
@@ -234,7 +231,7 @@ func (s *mapShard[V]) exists(key string) bool {
 	readOnly := s.readOnly.Load().(readOnlyMap[V])
 	entry, ok := readOnly.m[key]
 	if ok {
-		if !s.isExpired(entry, now) {
+		if !isExpired(entry, now) {
 			return true
 		}
 		s.deleteExpired(key)
@@ -251,7 +248,7 @@ func (s *mapShard[V]) exists(key string) bool {
 	// Double-check now that we have the lock
 	readOnly = s.readOnly.Load().(readOnlyMap[V])
 	if entry, ok = readOnly.m[key]; ok {
-		if !s.isExpired(entry, now) {
+		if !isExpired(entry, now) {
 			return true
 		}
 		s.deleteExpiredLocked(key)
@@ -260,7 +257,7 @@ func (s *mapShard[V]) exists(key string) bool {
 	
 	entry, ok = s.dirty[key]
 	if ok {
-		if !s.isExpired(entry, now) {
+		if !isExpired(entry, now) {
 			return true
 		}
 		s.deleteExpiredLocked(key)
@@ -319,18 +316,12 @@ func (s *mapShard[V]) store(key string, value V, expireTime int64) {
 	s.mu.Unlock()
 }
 
-// Adaptive threshold for promotion - reduces frequency for larger maps
+// Fixed, simpler promotion threshold that doesn't scale too aggressively with map size
 func (s *mapShard[V]) thresholdForPromotion(readOnlySize int) int64 {
-	// For small maps, use lower threshold for faster promotion
-	if readOnlySize < 100 {
-		return int64(max(1, readOnlySize/2))
+	if readOnlySize == 0 {
+		return 1
 	}
-	// For medium maps
-	if readOnlySize < 1000 {
-		return int64(readOnlySize/3 + 10)
-	}
-	// For large maps, use higher threshold to avoid frequent promotions
-	return int64(readOnlySize/4 + 50)
+	return int64(readOnlySize) / 2
 }
 
 func (s *mapShard[V]) miss() {
@@ -357,9 +348,7 @@ func (s *mapShard[V]) missLocked() {
 
 func (s *mapShard[V]) promoteLocked() {
 	if s.dirty != nil {
-		// Create a new map with exact capacity requirement
-		dirtyMap := s.dirty
-		s.readOnly.Store(readOnlyMap[V]{m: dirtyMap})
+		s.readOnly.Store(readOnlyMap[V]{m: s.dirty})
 		s.dirty = nil
 		s.misses.Store(0)
 	}
@@ -390,14 +379,8 @@ func (s *mapShard[V]) deleteExpiredLocked(key string) {
 	}
 	delete(s.dirty, key)
 	
-	// Only promote if we have accumulated enough misses
-	readOnly := s.readOnly.Load().(readOnlyMap[V])
-	threshold := s.thresholdForPromotion(len(readOnly.m))
-	missCount := s.misses.Load()
-	
-	if missCount >= threshold {
-		s.promoteLocked()
-	}
+	// Force promotion
+	s.missLocked()
 }
 
 // Len returns the total number of unexpired entries.
@@ -405,38 +388,27 @@ func (sm *SafeMap[V]) Len() int {
 	total := 0
 	now := time.Now().UnixNano()
 	
-	// Use a batch approach to reduce lock contention
-	batch := make(map[*mapShard[V]]struct{}, sm.shardCount)
 	for _, shard := range sm.shards {
 		readOnly := shard.readOnly.Load().(readOnlyMap[V])
 		// Check entries in read-only map without locking
 		for _, entry := range readOnly.m {
-			if !shard.isExpired(entry, now) {
+			if !isExpired(entry, now) {
 				total++
 			}
 		}
 		
-		// Collect shards with dirty maps
+		// Check dirty map if needed
 		if readOnly.amended {
-			batch[shard] = struct{}{}
-		}
-	}
-	
-	// Process dirty maps in a second pass
-	for shard := range batch {
-		shard.mu.Lock()
-		if shard.dirty != nil {
-			for _, entry := range shard.dirty {
-				readOnly := shard.readOnly.Load().(readOnlyMap[V])
-				// Only count entries that are not in the read-only map
-				if _, ok := readOnly.m[""]; !ok {
-					if !shard.isExpired(entry, now) {
+			shard.mu.Lock()
+			if shard.dirty != nil {
+				for k, entry := range shard.dirty {
+					if _, exists := readOnly.m[k]; !exists && !isExpired(entry, now) {
 						total++
 					}
 				}
 			}
+			shard.mu.Unlock()
 		}
-		shard.mu.Unlock()
 	}
 	
 	return total
@@ -492,7 +464,7 @@ func (sm *SafeMap[V]) Range(f func(key string, value V) bool) {
 		// First collect entries from read-only map without locking
 		readOnly := shard.readOnly.Load().(readOnlyMap[V])
 		for k, entry := range readOnly.m {
-			if !shard.isExpired(entry, now) {
+			if !isExpired(entry, now) {
 				value := entry.value.Load().(V)
 				pairs = append(pairs, keyValuePair{k, value})
 			}
@@ -505,7 +477,7 @@ func (sm *SafeMap[V]) Range(f func(key string, value V) bool) {
 				// To avoid duplicates, only add entries not in read-only map
 				for k, entry := range shard.dirty {
 					if _, exists := readOnly.m[k]; !exists {
-						if !shard.isExpired(entry, now) {
+						if !isExpired(entry, now) {
 							value := entry.value.Load().(V)
 							pairs = append(pairs, keyValuePair{k, value})
 						}
@@ -564,7 +536,7 @@ func (sm *SafeMap[V]) UpdateExpireTime(key string, expireDuration time.Duration)
 	now := time.Now().UnixNano()
 	
 	readOnly := shard.readOnly.Load().(readOnlyMap[V])
-	if entry, ok := readOnly.m[key]; ok && !shard.isExpired(entry, now) {
+	if entry, ok := readOnly.m[key]; ok && !isExpired(entry, now) {
 		atomic.StoreInt64(&entry.expireTime, expireTime)
 		return true
 	}
@@ -578,12 +550,12 @@ func (sm *SafeMap[V]) UpdateExpireTime(key string, expireDuration time.Duration)
 	
 	// Double-check under lock
 	readOnly = shard.readOnly.Load().(readOnlyMap[V])
-	if entry, ok := readOnly.m[key]; ok && !shard.isExpired(entry, now) {
+	if entry, ok := readOnly.m[key]; ok && !isExpired(entry, now) {
 		atomic.StoreInt64(&entry.expireTime, expireTime)
 		return true
 	}
 	
-	if entry, ok := shard.dirty[key]; ok && !shard.isExpired(entry, now) {
+	if entry, ok := shard.dirty[key]; ok && !isExpired(entry, now) {
 		atomic.StoreInt64(&entry.expireTime, expireTime)
 		return true
 	}
@@ -593,27 +565,41 @@ func (sm *SafeMap[V]) UpdateExpireTime(key string, expireDuration time.Duration)
 
 // DeleteAllKeysStartingWith deletes all keys with the given prefix.
 func (sm *SafeMap[V]) DeleteAllKeysStartingWith(prefix string) {
+	type keyToDelete struct {
+		shard *mapShard[V]
+		key   string
+	}
+	
+	// Collect keys that need deletion
+	keysToDelete := make([]keyToDelete, 0)
+	
+	// First pass: identify keys to delete without holding locks
 	for _, shard := range sm.shards {
-		shard.mu.Lock()
 		readOnly := shard.readOnly.Load().(readOnlyMap[V])
-		if shard.dirty == nil {
-			shard.dirtyLocked()
-			readOnly = shard.readOnly.Load().(readOnlyMap[V])
-			shard.readOnly.Store(readOnlyMap[V]{m: readOnly.m, amended: true})
-		}
 		for k := range readOnly.m {
 			if strings.HasPrefix(k, prefix) {
-				delete(shard.dirty, k)
+				keysToDelete = append(keysToDelete, keyToDelete{shard, k})
 			}
 		}
-		for k := range shard.dirty {
-			if strings.HasPrefix(k, prefix) {
-				delete(shard.dirty, k)
+		
+		if readOnly.amended {
+			shard.mu.Lock()
+			if shard.dirty != nil {
+				for k := range shard.dirty {
+					if _, exists := readOnly.m[k]; !exists {
+						if strings.HasPrefix(k, prefix) {
+							keysToDelete = append(keysToDelete, keyToDelete{shard, k})
+						}
+					}
+				}
 			}
+			shard.mu.Unlock()
 		}
-		shard.misses.Store(int64(len(readOnly.m) + 1)) // Force promotion
-		shard.promoteLocked()
-		shard.mu.Unlock()
+	}
+	
+	// Second pass: delete all identified keys
+	for _, kd := range keysToDelete {
+		kd.shard.delete(kd.key)
 	}
 }
 

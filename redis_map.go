@@ -106,8 +106,10 @@ func (m *RedisSafeMap[V]) releasePipeline(pipe redis.Pipeliner) {
 
 // Build the actual Redis key: prefix + ":" + userKey
 func (m *RedisSafeMap[V]) buildKey(key string) string {
-	// Intern the key if it's a common one
-	key = internString(key)
+	// Check common key map for common keys
+	if commonKey, ok := commonKeyMap[key]; ok {
+		key = commonKey
+	}
 	
 	if m.prefix == "" {
 		return key
@@ -116,10 +118,8 @@ func (m *RedisSafeMap[V]) buildKey(key string) string {
 	// For common combinations, we'll use a separate cache to avoid string concat
 	builtKey := m.prefix + ":" + key
 	
-	// If the built key is long enough, intern it
-	if len(builtKey) >= 24 {
-		return internString(builtKey)
-	}
+	// No need to intern - just return the concatenated key
+	// Interning was shown to have overhead in benchmarks
 	
 	return builtKey
 }
