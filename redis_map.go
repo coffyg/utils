@@ -206,51 +206,83 @@ func (m *RedisSafeMap[V]) Exists(key string) bool {
 
 // Set inserts/updates a value with no expiration.
 func (m *RedisSafeMap[V]) Set(key string, value V) {
+	client := m.getClient()
 	rkey := m.buildKey(key)
+	setKey := m.getSetKey()
+	
+	// Encode value
 	data, err := encodeValue(value)
 	if err != nil {
 		return
 	}
-	// Get a pipeline from the pool
-	pipe := m.getPipeline()
-	defer m.releasePipeline(pipe)
+	
+	// Use client.Pipeline() directly instead of pool
+	pipe := client.Pipeline()
+	defer pipe.Discard()
 	
 	// Pipeline the SET + SADD for better concurrency
 	pipe.Set(ctx, rkey, data, 0)
-	pipe.SAdd(ctx, m.getSetKey(), key) // store the *unprefixed* key in the set
-	_, _ = pipe.Exec(ctx)
+	pipe.SAdd(ctx, setKey, key) // store the *unprefixed* key in the set
+	
+	// Execute and handle errors
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		// Fall back to direct operations if pipeline fails
+		client.Set(ctx, rkey, data, 0)
+		client.SAdd(ctx, setKey, key)
+	}
 }
 
 // SetWithExpireDuration inserts/updates with TTL.
 func (m *RedisSafeMap[V]) SetWithExpireDuration(key string, value V, expire time.Duration) {
+	client := m.getClient()
 	rkey := m.buildKey(key)
+	setKey := m.getSetKey()
+	
+	// Encode value
 	data, err := encodeValue(value)
 	if err != nil {
 		return
 	}
 	
-	// Get a pipeline from the pool
-	pipe := m.getPipeline()
-	defer m.releasePipeline(pipe)
+	// Use client.Pipeline() directly instead of pool
+	pipe := client.Pipeline()
+	defer pipe.Discard()
 	
 	// Pipeline SET with expiration and SADD
 	pipe.Set(ctx, rkey, data, expire)
-	pipe.SAdd(ctx, m.getSetKey(), key)
-	_, _ = pipe.Exec(ctx)
+	pipe.SAdd(ctx, setKey, key)
+	
+	// Execute and handle errors
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		// Fall back to direct operations if pipeline fails
+		client.Set(ctx, rkey, data, expire)
+		client.SAdd(ctx, setKey, key)
+	}
 }
 
 // Delete removes a key from redis and from our set
 func (m *RedisSafeMap[V]) Delete(key string) {
+	client := m.getClient()
 	rkey := m.buildKey(key)
+	setKey := m.getSetKey()
 	
-	// Get a pipeline from the pool
-	pipe := m.getPipeline()
-	defer m.releasePipeline(pipe)
+	// Use client.Pipeline() directly
+	pipe := client.Pipeline()
+	defer pipe.Discard()
 	
 	// Pipeline DEL and SREM
 	pipe.Del(ctx, rkey)
-	pipe.SRem(ctx, m.getSetKey(), key)
-	_, _ = pipe.Exec(ctx)
+	pipe.SRem(ctx, setKey, key)
+	
+	// Execute and handle errors
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		// Fall back to direct operations
+		client.Del(ctx, rkey)
+		client.SRem(ctx, setKey, key)
+	}
 }
 
 // UpdateExpireTime extends or sets TTL for an existing key. If key does not exist, returns false.
@@ -269,32 +301,44 @@ func (m *RedisSafeMap[V]) UpdateExpireTime(key string, expire time.Duration) boo
 // (We still store the unprefixed key in our set. So we can filter easily.)
 func (m *RedisSafeMap[V]) DeleteAllKeysStartingWith(prefixArg string) {
 	client := m.getClient()
-
-	// We'll scan the set for matching keys, then delete them in a pipeline.
-	var cursor uint64
 	setKey := m.getSetKey()
+
+	// Process in smaller batches to avoid large pipelines
+	maxBatchSize := 100
+	var cursor uint64 = 0
 
 	for {
 		// sscan the *set* for keys that start with prefixArg
 		// The pattern "prefixArg*" matches the *raw/unprefixed* keys in the set.
-		keys, cur, err := client.SScan(ctx, setKey, cursor, prefixArg+"*", 300).Result()
+		keys, nextCursor, err := client.SScan(ctx, setKey, cursor, prefixArg+"*", int64(maxBatchSize)).Result()
 		if err != nil {
 			break
 		}
+		
+		// If we found matching keys, delete them
 		if len(keys) > 0 {
-			// Get a pipeline from the pool
-			pipe := m.getPipeline()
+			// Use direct client pipeline instead of pool to avoid issues
+			pipe := client.Pipeline()
 			
+			// Add delete operations to pipeline
 			for _, k := range keys {
 				pipe.Del(ctx, m.buildKey(k))
 				pipe.SRem(ctx, setKey, k)
 			}
-			_, _ = pipe.Exec(ctx)
 			
-			// Return the pipeline to the pool
-			m.releasePipeline(pipe)
+			// Execute pipeline and check for errors
+			_, err := pipe.Exec(ctx)
+			if err != nil {
+				// Fall back to individual operations if pipeline fails
+				for _, k := range keys {
+					client.Del(ctx, m.buildKey(k))
+					client.SRem(ctx, setKey, k)
+				}
+			}
 		}
-		cursor = cur
+		
+		// Update cursor for next batch
+		cursor = nextCursor
 		if cursor == 0 {
 			break
 		}
@@ -311,29 +355,44 @@ func (m *RedisSafeMap[V]) ExpiredAndGet(key string) (V, bool) {
 func (m *RedisSafeMap[V]) Clear() {
 	client := m.getClient()
 	setKey := m.getSetKey()
-
-	// We'll just sscan all keys in the set, remove them, then empty the set.
-	var cursor uint64
+	
+	// Process in batches to avoid large pipelines
+	maxBatchSize := 100
+	var cursor uint64 = 0
+	
 	for {
-		keys, cur, err := client.SScan(ctx, setKey, cursor, "*", 300).Result()
+		// Get members in smaller batches
+		members, nextCursor, err := client.SScan(ctx, setKey, cursor, "*", int64(maxBatchSize)).Result()
 		if err != nil {
 			break
 		}
-		if len(keys) > 0 {
-			// Get a pipeline from the pool
-			pipe := m.getPipeline()
+		
+		// If we got members, delete them
+		if len(members) > 0 {
+			// Use direct client instead of pipeline pool to avoid issues
+			pipe := client.Pipeline()
 			
-			for _, k := range keys {
+			// Delete all keys in this batch
+			for _, k := range members {
 				pipe.Del(ctx, m.buildKey(k))
 			}
-			// after we delete all, we can also SREM them from the set
-			pipe.SRem(ctx, setKey, keys)
-			_, _ = pipe.Exec(ctx)
 			
-			// Return pipeline to the pool
-			m.releasePipeline(pipe)
+			// Remove members from the set
+			pipe.SRem(ctx, setKey, members)
+			
+			// Execute pipeline and check for errors
+			_, err := pipe.Exec(ctx)
+			if err != nil {
+				// If pipeline fails, try again with individual operations
+				for _, k := range members {
+					client.Del(ctx, m.buildKey(k))
+					client.SRem(ctx, setKey, k)
+				}
+			}
 		}
-		cursor = cur
+		
+		// Update cursor for next batch
+		cursor = nextCursor
 		if cursor == 0 {
 			break
 		}

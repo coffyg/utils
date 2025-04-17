@@ -284,3 +284,224 @@ func TestSafeMapRange(t *testing.T) {
 		}
 	}
 }
+
+func TestSafeMapClearConcurrent(t *testing.T) {
+	sm := NewSafeMap[int]()
+	var wg sync.WaitGroup
+	
+	// Fill the map with some data
+	for i := 0; i < 1000; i++ {
+		sm.Set("key_"+strconv.Itoa(i), i)
+	}
+	
+	// Ensure the data was added properly
+	if sm.Len() != 1000 {
+		t.Errorf("Expected to have 1000 entries before clearing, got %d", sm.Len())
+	}
+	
+	// Number of goroutines to run
+	numGoroutines := 10
+	
+	// Start goroutines that use the map while clearing
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			if id == 0 {
+				// One goroutine clears the map
+				sm.Clear()
+			} else if id % 2 == 0 {
+				// Half of the others read from the map
+				for j := 0; j < 100; j++ {
+					key := "key_" + strconv.Itoa(rand.Intn(1000))
+					_, _ = sm.Get(key)
+					time.Sleep(time.Microsecond)
+				}
+			} else {
+				// The other half write to the map
+				for j := 0; j < 100; j++ {
+					key := "new_key_" + strconv.Itoa(id) + "_" + strconv.Itoa(j)
+					sm.Set(key, j)
+					time.Sleep(time.Microsecond)
+				}
+			}
+		}(i)
+	}
+	
+	wg.Wait()
+	
+	// Ensure the map still works after concurrent clearing and operations
+	// Add some data again
+	for i := 0; i < 10; i++ {
+		sm.Set("post_clear_key_"+strconv.Itoa(i), i)
+	}
+	
+	// Verify we can read the data
+	for i := 0; i < 10; i++ {
+		key := "post_clear_key_" + strconv.Itoa(i)
+		val, exists := sm.Get(key)
+		if !exists || val != i {
+			t.Errorf("Expected %s to exist with value %d after Clear and new additions", key, i)
+		}
+	}
+}
+
+func TestSafeMapClearAfterExpiration(t *testing.T) {
+	sm := NewSafeMap[int]()
+	
+	// Add some items with expiration
+	for i := 0; i < 10; i++ {
+		sm.SetWithExpireDuration("expire_key_"+strconv.Itoa(i), i, 50*time.Millisecond)
+	}
+	
+	// Add some items without expiration
+	for i := 0; i < 10; i++ {
+		sm.Set("permanent_key_"+strconv.Itoa(i), i)
+	}
+	
+	// Wait for expiration
+	time.Sleep(100 * time.Millisecond)
+	
+	// Verify expired items are gone
+	for i := 0; i < 10; i++ {
+		_, exists := sm.Get("expire_key_" + strconv.Itoa(i))
+		if exists {
+			t.Errorf("Key expire_key_%d should have expired", i)
+		}
+	}
+	
+	// Now clear the map
+	sm.Clear()
+	
+	// Verify all items are gone
+	if sm.Len() != 0 {
+		t.Errorf("Expected length to be 0 after Clear, got %d", sm.Len())
+	}
+	
+	// Add new items and verify they work correctly
+	sm.Set("new_key", 100)
+	val, exists := sm.Get("new_key")
+	if !exists || val != 100 {
+		t.Errorf("Expected new key to exist with value 100 after Clear")
+	}
+}
+
+func TestSafeMapClearAndDelete(t *testing.T) {
+	sm := NewSafeMap[int]()
+	
+	// Add some items
+	for i := 0; i < 100; i++ {
+		sm.Set("key_"+strconv.Itoa(i), i)
+	}
+	
+	// Clear the map
+	sm.Clear()
+	
+	// Verify it's empty
+	if sm.Len() != 0 {
+		t.Errorf("Expected length to be 0 after Clear, got %d", sm.Len())
+	}
+	
+	// Try to delete keys that don't exist anymore
+	for i := 0; i < 10; i++ {
+		sm.Delete("key_" + strconv.Itoa(i))
+	}
+	
+	// Verify the length is still 0
+	if sm.Len() != 0 {
+		t.Errorf("Expected length to be 0 after deleting cleared keys, got %d", sm.Len())
+	}
+	
+	// Add new items
+	for i := 0; i < 10; i++ {
+		sm.Set("new_key_"+strconv.Itoa(i), i)
+	}
+	
+	// Verify the length is correct
+	if sm.Len() != 10 {
+		t.Errorf("Expected length to be 10 after adding new keys, got %d", sm.Len())
+	}
+}
+
+func TestSafeMapDeleteWithComplexPrefixes(t *testing.T) {
+	sm := NewSafeMap[string]()
+	
+	// Add keys with complex prefixes
+	userUUID := "550e8400-e29b-41d4-a716-446655440000"
+	personaUUID := "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+	slugName := "john-doe"
+	userSlug := "user-123"
+	
+	// Add various types of keys
+	sm.Set("/Persona/"+slugName+"/details", "persona details")
+	sm.Set("/Persona/"+slugName+"/settings", "persona settings")
+	sm.Set("/Persona/"+slugName+"/posts/recent", "recent posts")
+	sm.Set("/User/_Personas/"+userSlug+"/list", "user personas list")
+	sm.Set("/User/_Personas/"+userSlug+"/count", "user personas count")
+	sm.Set("persona:"+personaUUID+":info", "persona info by UUID")
+	sm.Set("persona:"+personaUUID+":stats", "persona stats by UUID")
+	sm.Set("user:"+userUUID+":session", "user session")
+	sm.Set("user:"+userUUID+":prefs", "user preferences")
+	sm.Set("thread:user:"+userUUID+":posts", "user posts")
+	sm.Set("unrelated:key", "unrelated value")
+	
+	// Initial count should be 11
+	if sm.Len() != 11 {
+		t.Errorf("Expected 11 items, got %d", sm.Len())
+	}
+	
+	// Test deleting with the Persona slug prefix
+	sm.DeleteAllKeysStartingWith("/Persona/" + slugName)
+	
+	// Should have deleted 3 keys
+	if sm.Len() != 8 {
+		t.Errorf("Expected 8 remaining items after deleting Persona slug prefix, got %d", sm.Len())
+	}
+	
+	// Verify specific keys are gone
+	if sm.Exists("/Persona/"+slugName+"/details") {
+		t.Errorf("Expected /Persona/%s/details to be deleted", slugName)
+	}
+	
+	// Test deleting with the User personas prefix
+	sm.DeleteAllKeysStartingWith("/User/_Personas/" + userSlug)
+	
+	// Should have deleted 2 more keys
+	if sm.Len() != 6 {
+		t.Errorf("Expected 6 remaining items after deleting User personas prefix, got %d", sm.Len())
+	}
+	
+	// Test deleting with the persona UUID prefix
+	sm.DeleteAllKeysStartingWith("persona:" + personaUUID)
+	
+	// Should have deleted 2 more keys
+	if sm.Len() != 4 {
+		t.Errorf("Expected 4 remaining items after deleting persona UUID prefix, got %d", sm.Len())
+	}
+	
+	// Test deleting with the user UUID prefix (includes thread:user:)
+	sm.DeleteAllKeysStartingWith("user:" + userUUID)
+	
+	// Should have deleted 2 more keys (but not thread:user:)
+	if sm.Len() != 2 {
+		t.Errorf("Expected 2 remaining items after deleting user UUID prefix, got %d", sm.Len())
+	}
+	
+	// Verify thread:user: key still exists
+	if !sm.Exists("thread:user:"+userUUID+":posts") {
+		t.Errorf("Expected thread:user:%s:posts to still exist", userUUID)
+	}
+	
+	// Now test exact match prefix for thread:user:
+	sm.DeleteAllKeysStartingWith("thread:user:" + userUUID)
+	
+	// Should have deleted 1 more key
+	if sm.Len() != 1 {
+		t.Errorf("Expected 1 remaining item after deleting thread:user: prefix, got %d", sm.Len())
+	}
+	
+	// Only unrelated:key should remain
+	if !sm.Exists("unrelated:key") {
+		t.Errorf("Expected unrelated:key to still exist")
+	}
+}
