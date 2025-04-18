@@ -565,41 +565,48 @@ func (sm *SafeMap[V]) UpdateExpireTime(key string, expireDuration time.Duration)
 
 // DeleteAllKeysStartingWith deletes all keys with the given prefix.
 func (sm *SafeMap[V]) DeleteAllKeysStartingWith(prefix string) {
-	type keyToDelete struct {
-		shard *mapShard[V]
-		key   string
-	}
-	
-	// Collect keys that need deletion
-	keysToDelete := make([]keyToDelete, 0)
-	
-	// First pass: identify keys to delete without holding locks
+	// We need to lock each shard while deleting, one at a time
 	for _, shard := range sm.shards {
+		// Acquire lock for this shard
+		shard.mu.Lock()
+
+		// With lock held, identify keys with the prefix and delete them directly
+		// First, ensure we have a dirty map
+		if shard.dirty == nil {
+			shard.dirtyLocked()
+		}
+		
+		// We need to mark the readOnly map as amended since we're making changes
 		readOnly := shard.readOnly.Load().(readOnlyMap[V])
+		if !readOnly.amended {
+			shard.readOnly.Store(readOnlyMap[V]{m: readOnly.m, amended: true})
+		}
+		
+		// Delete keys from readOnly map by removing them from dirty
+		// (they will be gone after the next promotion)
 		for k := range readOnly.m {
 			if strings.HasPrefix(k, prefix) {
-				keysToDelete = append(keysToDelete, keyToDelete{shard, k})
+				delete(shard.dirty, k)
 			}
 		}
 		
-		if readOnly.amended {
-			shard.mu.Lock()
-			if shard.dirty != nil {
-				for k := range shard.dirty {
-					if _, exists := readOnly.m[k]; !exists {
-						if strings.HasPrefix(k, prefix) {
-							keysToDelete = append(keysToDelete, keyToDelete{shard, k})
-						}
-					}
-				}
+		// Delete keys directly from dirty map
+		// (including any that weren't in readOnly)
+		for k := range shard.dirty {
+			if strings.HasPrefix(k, prefix) {
+				delete(shard.dirty, k)
 			}
-			shard.mu.Unlock()
 		}
-	}
-	
-	// Second pass: delete all identified keys
-	for _, kd := range keysToDelete {
-		kd.shard.delete(kd.key)
+		
+		// Immediately promote the changes to ensure consistency
+		// This is the key difference - we force promotion EVERY time
+		readOnly = readOnlyMap[V]{m: shard.dirty}
+		shard.readOnly.Store(readOnly)
+		shard.dirty = nil
+		shard.misses.Store(0)
+		
+		// Release the lock for this shard
+		shard.mu.Unlock()
 	}
 }
 
