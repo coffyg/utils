@@ -23,6 +23,9 @@ type CronJob struct {
 	// protected by CronManager.mu
 	timer  *time.Timer
 	cancel context.CancelFunc
+	
+	// For high frequency jobs
+	minWaitTime time.Duration // Minimum wait time between runs
 }
 
 type CronManager struct {
@@ -59,12 +62,22 @@ func (m *CronManager) AddCron(name string, job Job, interval time.Duration, runI
 	}
 
 	jobCtx, cancel := context.WithCancel(m.ctx)
+	
+	// Set minimum wait time to prevent CPU thrashing
+	// Jobs with very short intervals (below 10ms) get a minimum wait 
+	// time to prevent excessive CPU usage
+	minWaitTime := time.Millisecond // Base minimum for all jobs
+	if interval < 10*time.Millisecond {
+		minWaitTime = 5 * time.Millisecond // Increased minimum for high-frequency jobs
+	}
+	
 	cronJob := &CronJob{
-		Name:     name,
-		Action:   job,
-		Interval: interval,
-		RunImmed: runImmed,
-		cancel:   cancel,
+		Name:        name,
+		Action:      job,
+		Interval:    interval,
+		RunImmed:    runImmed,
+		cancel:      cancel,
+		minWaitTime: minWaitTime,
 	}
 	
 	now := time.Now()
@@ -95,9 +108,21 @@ func (m *CronManager) scheduleJobLocked(job *CronJob, ctx context.Context) {
 	nextRun := job.nextRun.Load()
 	delay := nextRun.Sub(now)
 	
-	// If delay is negative (e.g., for immediate execution), set to zero
+	// If delay is negative (e.g., for immediate execution), set to minimum wait time
 	if delay < 0 {
-		delay = 0
+		if job.minWaitTime > 0 {
+			delay = job.minWaitTime
+		} else {
+			delay = time.Millisecond // Minimum 1ms delay to prevent CPU thrashing
+		}
+	} else if delay < job.minWaitTime && job.minWaitTime > 0 {
+		// Ensure we respect minimum wait time for high-frequency jobs
+		delay = job.minWaitTime
+	}
+
+	// Ensure we never use a delay less than 1ms to prevent CPU thrashing
+	if delay < time.Millisecond {
+		delay = time.Millisecond
 	}
 
 	// Timer callback must acquire lock before modifying shared state
@@ -128,6 +153,23 @@ func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context)
 	// Double-check context hasn't been canceled while waiting for lock
 	if m.ctx.Err() == nil && ctx.Err() == nil {
 		nextDelay := nextRunTime.Sub(now)
+		
+		// Apply minimum delay rules
+		if nextDelay < 0 {
+			// We're already behind schedule
+			if job.minWaitTime > 0 {
+				nextDelay = job.minWaitTime
+			} else {
+				nextDelay = time.Millisecond // Minimum 1ms delay
+			}
+		} else if nextDelay < job.minWaitTime && job.minWaitTime > 0 {
+			// Respect minimum wait time for high-frequency jobs
+			nextDelay = job.minWaitTime
+		} else if nextDelay < time.Millisecond {
+			// Absolute minimum delay
+			nextDelay = time.Millisecond
+		}
+		
 		job.timer = time.AfterFunc(nextDelay, func() {
 			m.executeJobAndReschedule(job, ctx)
 		})
@@ -142,17 +184,31 @@ func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context)
 			defer m.wg.Done()
 			defer job.running.Store(false)
 			
-			jobCtx, cancel := context.WithTimeout(ctx, job.Interval)
+			// For very high-frequency jobs, use a timeout proportional to the interval
+			// but with a reasonable minimum to prevent resource exhaustion
+			timeoutDuration := job.Interval
+			if timeoutDuration < 10*time.Millisecond {
+				timeoutDuration = 10 * time.Millisecond // Minimum reasonable timeout
+			}
+			
+			// Set a timeout that prevents long-running jobs from consuming resources indefinitely
+			jobCtx, cancel := context.WithTimeout(ctx, timeoutDuration)
 			defer cancel()
 			
 			done := make(chan struct{}, 1)
 			
+			// Run the actual job in yet another goroutine to allow for timeout handling
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
 						m.logger.Error().Msgf("[cron|%s|%s] panicked: %v", job.Name, job.Interval, r)
 					}
-					done <- struct{}{}
+					select {
+					case done <- struct{}{}:
+						// Successfully sent completion signal
+					default:
+						// Channel might be full or closed, which is fine
+					}
 				}()
 				
 				job.Action()
@@ -160,14 +216,26 @@ func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context)
 			
 			select {
 			case <-done:
+				// Only log completion at debug level to avoid excessive logging
+				// with many frequently-running jobs
 				m.logger.Debug().Msgf("[cron|%s|%s] completed", job.Name, job.Interval)
 			case <-jobCtx.Done():
-				m.logger.Error().Msgf("[cron|%s|%s] timed out or canceled", job.Name, job.Interval)
+				// This handles both timeouts and cancellations - only log at Error level for custom timeouts
+				if job.Interval >= 10*time.Millisecond {
+					m.logger.Error().Msgf("[cron|%s|%s] timed out or canceled", job.Name, job.Interval)
+				} else {
+					// Use debug level for very frequent jobs to reduce log spam
+					m.logger.Debug().Msgf("[cron|%s|%s] timed out or canceled", job.Name, job.Interval)
+				}
 			}
 		}()
 	} else {
 		// Job is still running from previous interval, log and continue
-		m.logger.Warn().Msgf("[cron|%s|%s] still running from previous interval, skipping", job.Name, job.Interval)
+		// Use Debug instead of Warn for high-frequency jobs to avoid log spam
+		if job.Interval > 100*time.Millisecond {
+			// Only log skipped jobs with larger intervals to avoid excessive logging
+			m.logger.Debug().Msgf("[cron|%s|%s] still running from previous interval, skipping", job.Name, job.Interval)
+		}
 	}
 }
 

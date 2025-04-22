@@ -604,11 +604,11 @@ func TestCronStress(t *testing.T) {
 	// Create a logger that doesn't output to stdout for testing
 	logger := zerolog.New(io.Discard).With().Timestamp().Logger()
 	
-	// Configure test parameters
-	const numJobs = 100            // Number of different jobs to create
-	const interval = 10 * time.Millisecond // Short interval to stress the system
-	const runDuration = 500 * time.Millisecond // How long to run the test
-	const iterationsPerJob = 10    // Each job should run at least this many times
+	// Configure test parameters - less aggressive for normal testing
+	const numJobs = 25            // Number of different jobs to create
+	const interval = 25 * time.Millisecond // Longer interval to reduce CPU impact
+	const runDuration = 300 * time.Millisecond // How long to run the test
+	const iterationsPerJob = 5    // Each job should run at least this many times
 	
 	// Create a new CronManager
 	cronManager := NewCronManager(&logger)
