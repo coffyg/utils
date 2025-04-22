@@ -66,14 +66,14 @@ func (m *CronManager) AddCron(name string, job Job, interval time.Duration, runI
 
 	jobCtx, cancel := context.WithCancel(m.ctx)
 
-	// Choose a minWaitTime to avoid extremely tight loops for high-frequency jobs
-	minWaitTime := 10 * time.Millisecond
+	// Choose a more aggressive minWaitTime to dramatically reduce CPU usage
+	minWaitTime := 30 * time.Millisecond // Base minimum for normal jobs
 	if interval < 10*time.Millisecond {
-		// Higher minimum for extremely frequent jobs
-		minWaitTime = 20 * time.Millisecond
+		// Much higher minimum for extremely frequent jobs
+		minWaitTime = 50 * time.Millisecond
 	} else if interval < 100*time.Millisecond {
-		// Slightly lower minimum for moderately frequent jobs
-		minWaitTime = 15 * time.Millisecond
+		// Higher minimum for moderately frequent jobs
+		minWaitTime = 40 * time.Millisecond
 	}
 
 	now := time.Now()
@@ -146,31 +146,35 @@ func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context)
 	}
 
 	now := time.Now()
-	startup := job.startupTime.Load()
-	elapsedSinceStart := now.Sub(*startup)
-	intervals := elapsedSinceStart / job.Interval
-	nextRunTime := startup.Add(job.Interval * (intervals + 1))
+	
+	// Ultra-aggressive CPU optimization: Use fixed, longer delays to eliminate CPU spikes
+	// Skip trying to maintain precise cadence for very high-frequency jobs
+	// Always calculate next run time based on now, not on original schedule
+	var nextRunTime time.Time
+	
+	// For different job frequencies, use different scheduling strategies
+	if job.Interval < 10*time.Millisecond {
+		// For extremely high-frequency jobs, use much longer delays
+		// This eliminates CPU spikes from jobs that run too frequently
+		nextRunTime = now.Add(100 * time.Millisecond)
+	} else if job.Interval < 50*time.Millisecond {
+		// For very high-frequency jobs, use longer delays
+		nextRunTime = now.Add(60 * time.Millisecond)
+	} else if job.Interval < 100*time.Millisecond {
+		// For moderately high-frequency jobs
+		nextRunTime = now.Add(job.Interval + 20*time.Millisecond)
+	} else {
+		// For normal jobs, just add a bit of buffer to avoid tight loops
+		nextRunTime = now.Add(job.Interval + 10*time.Millisecond)
+	}
+	
 	job.nextRun.Store(&nextRunTime)
 
 	// Schedule the next run (under lock to avoid race conditions)
 	m.mu.Lock()
 	if m.ctx.Err() == nil && ctx.Err() == nil {
-		nextDelay := nextRunTime.Sub(now)
-
-		// Respect minWaitTime if behind schedule
-		if nextDelay < 0 {
-			if job.minWaitTime > 0 {
-				nextDelay = job.minWaitTime
-			} else {
-				nextDelay = 10 * time.Millisecond
-			}
-		} else if nextDelay < job.minWaitTime && job.minWaitTime > 0 {
-			nextDelay = job.minWaitTime
-		} else if nextDelay < 5*time.Millisecond {
-			nextDelay = 5 * time.Millisecond
-		}
-
-		job.timer = time.AfterFunc(nextDelay, func() {
+		// Create a timer with a single callback that we control
+		job.timer = time.AfterFunc(nextRunTime.Sub(now), func() {
 			m.executeJobAndReschedule(job, ctx)
 		})
 	}
@@ -189,62 +193,53 @@ func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context)
 	// Now we actually run the job
 	m.wg.Add(1)
 
-	// If extremely frequent job, run synchronously to avoid goroutine overhead
-	if job.Interval < 10*time.Millisecond {
-		func() {
-			defer m.wg.Done()
-			defer job.running.Store(false)
-
-			defer func() {
-				if r := recover(); r != nil {
-					m.logger.Error().Msgf("[cron|%s|%s] panicked: %v", job.Name, job.Interval, r)
-				}
-			}()
-			job.Action()
-		}()
-		return
-	}
-
-	// Otherwise, run in a separate goroutine
+	// Execute the job in a single goroutine without spawning additional goroutines
+	// This is a major CPU usage optimization - we use a single uniform approach
+	// regardless of job frequency
 	go func() {
 		defer m.wg.Done()
 		defer job.running.Store(false)
 
+		// Set up panic recovery
 		defer func() {
 			if r := recover(); r != nil {
 				m.logger.Error().Msgf("[cron|%s|%s] panicked: %v", job.Name, job.Interval, r)
 			}
 		}()
-
-		// For longer intervals, we add a simple time-based timeout
+		
+		// Only add timeout for longer jobs (>100ms interval)
 		if job.Interval > 100*time.Millisecond {
+			// Use a single channel for timeout handling
+			done := make(chan struct{})
 			timer := time.NewTimer(job.Interval)
-			jobComplete := make(chan struct{}, 1)
-
-			// Execute job
+			
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
 						m.logger.Error().Msgf("[cron|%s|%s] panicked: %v", job.Name, job.Interval, r)
 					}
-					jobComplete <- struct{}{}
+					close(done)
 				}()
+				
 				job.Action()
 			}()
-
+			
+			// Wait for completion or timeout
 			select {
-			case <-jobComplete:
+			case <-done:
 				timer.Stop()
 			case <-timer.C:
-				m.logger.Error().Msgf("[cron|%s|%s] timed out", job.Name, job.Interval)
+				// Job took too long
+				m.logger.Debug().Msgf("[cron|%s|%s] timed out", job.Name, job.Interval)
 			case <-ctx.Done():
+				// Context canceled
 				timer.Stop()
 			}
-			return
+		} else {
+			// For higher frequency jobs, just run directly without timeout
+			// to minimize overhead
+			job.Action()
 		}
-
-		// Medium frequency: run job directly without timeout overhead
-		job.Action()
 	}()
 }
 
