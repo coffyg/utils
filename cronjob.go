@@ -1,8 +1,9 @@
 package utils
 
 import (
-	"container/heap"
+	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -11,250 +12,201 @@ import (
 type Job func()
 
 type CronJob struct {
-	Action   Job
-	Interval time.Duration
-	RunImmed bool
-	nextRun  time.Time
-	Name     string
-	index    int // The index of the item in the heap.
-}
-
-type JobHeap []*CronJob
-
-func (h JobHeap) Len() int { return len(h) }
-
-func (h JobHeap) Less(i, j int) bool {
-	return h[i].nextRun.Before(h[j].nextRun)
-}
-
-func (h JobHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].index = i
-	h[j].index = j
-}
-
-func (h *JobHeap) Push(x interface{}) {
-	n := len(*h)
-	item := x.(*CronJob)
-	item.index = n
-	*h = append(*h, item)
-}
-
-func (h *JobHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	item.index = -1 // For safety.
-	*h = old[0 : n-1]
-	return item
+	Name        string
+	Action      Job
+	Interval    time.Duration
+	RunImmed    bool
+	running     atomic.Bool
+	nextRun     atomic.Pointer[time.Time]
+	startupTime atomic.Pointer[time.Time]
+	
+	// protected by CronManager.mu
+	timer  *time.Timer
+	cancel context.CancelFunc
 }
 
 type CronManager struct {
-	jobHeap    JobHeap
-	lock       sync.Mutex
-	wakeUpChan chan struct{}
-	stopChan   chan struct{}
-	running    bool
-	logger     *zerolog.Logger
-	wg         sync.WaitGroup // For dispatcher
-	jobWg      sync.WaitGroup // For jobs
+	jobs      map[string]*CronJob
+	mu        sync.RWMutex
+	logger    *zerolog.Logger
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancelCtx context.CancelFunc
 }
 
 func NewCronManager(logger *zerolog.Logger) *CronManager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &CronManager{
-		jobHeap:    make(JobHeap, 0),
-		wakeUpChan: make(chan struct{}, 1), // Buffered channel
-		stopChan:   make(chan struct{}),
-		logger:     logger,
+		jobs:      make(map[string]*CronJob),
+		logger:    logger,
+		ctx:       ctx,
+		cancelCtx: cancel,
 	}
 }
 
 func (m *CronManager) AddCron(name string, job Job, interval time.Duration, runImmed bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if existing, exists := m.jobs[name]; exists {
+		if existing.timer != nil {
+			existing.timer.Stop()
+		}
+		if existing.cancel != nil {
+			existing.cancel()
+		}
+		m.logger.Debug().Msgf("[cron|%s|%s] Replaced existing job", name, interval)
+	}
+
+	jobCtx, cancel := context.WithCancel(m.ctx)
 	cronJob := &CronJob{
+		Name:     name,
 		Action:   job,
 		Interval: interval,
 		RunImmed: runImmed,
-		Name:     name,
+		cancel:   cancel,
 	}
-
-	m.lock.Lock()
+	
+	now := time.Now()
 	if runImmed {
-		cronJob.nextRun = time.Now()
+		cronJob.nextRun.Store(&now)
 	} else {
-		cronJob.nextRun = time.Now().Add(interval)
+		nextRun := now.Add(interval)
+		cronJob.nextRun.Store(&nextRun)
+	}
+	
+	startTime := now
+	cronJob.startupTime.Store(&startTime)
+	
+	m.jobs[name] = cronJob
+
+	if m.ctx.Err() == nil { // Only schedule if manager is running
+		m.scheduleJobLocked(cronJob, jobCtx)
 	}
 
-	heap.Push(&m.jobHeap, cronJob)
-	m.lock.Unlock()
 	m.logger.Debug().Msgf("[cron|%s|%s] Added as job", name, interval)
-
-	// Signal to the dispatcher that a new job is available.
-	if m.running {
-		select {
-		case m.wakeUpChan <- struct{}{}:
-		default:
-		}
-	}
 }
 
-func (m *CronManager) runJob(cronJob *CronJob) {
-	m.jobWg.Add(1)
-	defer m.jobWg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			m.logger.Error().Msgf("[cron|%s|%s] panicked: %v", cronJob.Name, cronJob.Interval, r)
-		}
-	}()
-
-	// Create a new channel each time - pooling channels is risky because of the close operation
-	done := make(chan struct{})
+// scheduleJobLocked schedules a job to run at its next execution time
+// Caller must hold m.mu lock
+func (m *CronManager) scheduleJobLocked(job *CronJob, ctx context.Context) {
+	// Calculate time until the next run
+	now := time.Now()
+	nextRun := job.nextRun.Load()
+	delay := nextRun.Sub(now)
 	
-	go func() {
-		cronJob.Action()
-		close(done)
-	}()
-
-	// Use a pooled timer instead of time.After to avoid allocations
-	timer := getTimer(cronJob.Interval)
-	defer releaseTimer(timer)
-	
-	select {
-	case <-done:
-		m.logger.Debug().Msgf("[cron|%s|%s] completed", cronJob.Name, cronJob.Interval)
-	case <-timer.C:
-		m.logger.Error().Msgf("[cron|%s|%s] timed out", cronJob.Name, cronJob.Interval)
+	// If delay is negative (e.g., for immediate execution), set to zero
+	if delay < 0 {
+		delay = 0
 	}
+
+	// Timer callback must acquire lock before modifying shared state
+	job.timer = time.AfterFunc(delay, func() {
+		m.executeJobAndReschedule(job, ctx)
+	})
 }
 
-// timerPool reuses timer objects to reduce GC pressure
-var timerPool = sync.Pool{
-	New: func() interface{} {
-		return time.NewTimer(time.Hour)
-	},
-}
-
-// getTimer returns a timer from the pool or creates a new one
-func getTimer(d time.Duration) *time.Timer {
-	timer := timerPool.Get().(*time.Timer)
-	
-	// Stop the timer if it's running
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
+func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context) {
+	if ctx.Err() != nil {
+		return // Context canceled
 	}
-	
-	// Reset to the requested duration
-	timer.Reset(d)
-	return timer
-}
 
-// releaseTimer returns a timer to the pool
-func releaseTimer(t *time.Timer) {
-	if t == nil {
-		return
+	// Calculate the next run time based on the scheduled interval cadence
+	startupTime := job.startupTime.Load()
+	now := time.Now()
+	
+	// Calculate how many intervals have passed since startup
+	elapsedSinceStart := now.Sub(*startupTime)
+	intervals := elapsedSinceStart / job.Interval
+	
+	// Next run is at the next multiple of interval from the startup time
+	nextRunTime := startupTime.Add(job.Interval * (intervals + 1))
+	job.nextRun.Store(&nextRunTime)
+	
+	// Schedule next execution with mutex protection
+	m.mu.Lock()
+	// Double-check context hasn't been canceled while waiting for lock
+	if m.ctx.Err() == nil && ctx.Err() == nil {
+		nextDelay := nextRunTime.Sub(now)
+		job.timer = time.AfterFunc(nextDelay, func() {
+			m.executeJobAndReschedule(job, ctx)
+		})
 	}
+	m.mu.Unlock()
 	
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	
-	timerPool.Put(t)
-}
-
-func (m *CronManager) dispatcher() {
-	var timer *time.Timer
-	defer func() {
-		if timer != nil {
-			releaseTimer(timer)
-		}
-	}()
-	
-	for {
-		m.lock.Lock()
-		if len(m.jobHeap) == 0 {
-			m.lock.Unlock()
-			select {
-			case <-m.stopChan:
-				return
-			case <-m.wakeUpChan:
-				// New job added, continue
-			}
-			continue
-		}
-
-		nextJob := m.jobHeap[0]
-		now := time.Now()
-		delay := nextJob.nextRun.Sub(now)
-		m.lock.Unlock()
-
-		if delay <= 0 {
-			m.lock.Lock()
-			if !m.running {
-				m.lock.Unlock()
-				return
-			}
-			heap.Pop(&m.jobHeap)
-			m.lock.Unlock()
-
-			m.runJob(nextJob)
-
-			// Reschedule the job with more accurate timing
-			nextJob.nextRun = time.Now().Add(nextJob.Interval)
-
-			m.lock.Lock()
-			heap.Push(&m.jobHeap, nextJob)
-			m.lock.Unlock()
-		} else {
-			// Reuse timer to avoid allocations
-			if timer == nil {
-				timer = getTimer(delay)
-			} else {
-				timer.Reset(delay)
-			}
+	// Only run the job if it's not already running (prevents overlap)
+	if !job.running.Swap(true) {
+		// Execute the job asynchronously
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			defer job.running.Store(false)
+			
+			jobCtx, cancel := context.WithTimeout(ctx, job.Interval)
+			defer cancel()
+			
+			done := make(chan struct{}, 1)
+			
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						m.logger.Error().Msgf("[cron|%s|%s] panicked: %v", job.Name, job.Interval, r)
+					}
+					done <- struct{}{}
+				}()
+				
+				job.Action()
+			}()
 			
 			select {
-			case <-timer.C:
-				// Time to check the jobs again.
-			case <-m.stopChan:
-				return
-			case <-m.wakeUpChan:
-				// New job added, continue
+			case <-done:
+				m.logger.Debug().Msgf("[cron|%s|%s] completed", job.Name, job.Interval)
+			case <-jobCtx.Done():
+				m.logger.Error().Msgf("[cron|%s|%s] timed out or canceled", job.Name, job.Interval)
 			}
-		}
+		}()
+	} else {
+		// Job is still running from previous interval, log and continue
+		m.logger.Warn().Msgf("[cron|%s|%s] still running from previous interval, skipping", job.Name, job.Interval)
 	}
 }
 
 func (m *CronManager) Start() {
-	m.lock.Lock()
-	if m.running {
-		m.lock.Unlock()
-		return
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// Create new context if previously stopped
+	if m.ctx.Err() != nil {
+		m.ctx, m.cancelCtx = context.WithCancel(context.Background())
 	}
-	m.running = true
-	m.wakeUpChan = make(chan struct{}, 1) // Buffered channel
-	m.stopChan = make(chan struct{})
-	m.wg.Add(1) // For dispatcher
-	m.lock.Unlock()
-	go func() {
-		m.dispatcher()
-		m.wg.Done() // Signal that dispatcher has exited
-	}()
+	
+	// Start all jobs
+	for name, job := range m.jobs {
+		jobCtx, cancel := context.WithCancel(m.ctx)
+		job.cancel = cancel
+		m.logger.Debug().Msgf("[cron|%s|%s] Starting job", name, job.Interval)
+		m.scheduleJobLocked(job, jobCtx)
+	}
 }
 
 func (m *CronManager) Stop() {
-	m.lock.Lock()
-	if !m.running {
-		m.lock.Unlock()
-		return
+	m.mu.Lock()
+	
+	// Cancel the context to stop all jobs
+	m.cancelCtx()
+	
+	// Stop all timers
+	for _, job := range m.jobs {
+		if job.timer != nil {
+			job.timer.Stop()
+		}
+		if job.cancel != nil {
+			job.cancel()
+		}
 	}
-	m.running = false
-	close(m.stopChan)
-	m.lock.Unlock()
-	m.wg.Wait()    // Wait for dispatcher to finish
-	m.jobWg.Wait() // Wait for running jobs to finish
+	
+	m.mu.Unlock()
+	
+	// Wait for all running jobs to complete
+	m.wg.Wait()
 }
