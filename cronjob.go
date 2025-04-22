@@ -63,12 +63,13 @@ func (m *CronManager) AddCron(name string, job Job, interval time.Duration, runI
 
 	jobCtx, cancel := context.WithCancel(m.ctx)
 	
-	// Set minimum wait time to prevent CPU thrashing
-	// Jobs with very short intervals (below 10ms) get a minimum wait 
-	// time to prevent excessive CPU usage
-	minWaitTime := time.Millisecond // Base minimum for all jobs
+	// Set more aggressive minimum wait times to reduce CPU usage
+	// This will reduce precision but significantly decrease CPU load
+	minWaitTime := 10 * time.Millisecond // Base minimum for all jobs
 	if interval < 10*time.Millisecond {
-		minWaitTime = 5 * time.Millisecond // Increased minimum for high-frequency jobs
+		minWaitTime = 20 * time.Millisecond // Higher minimum for very high-frequency jobs
+	} else if interval < 100*time.Millisecond {
+		minWaitTime = 15 * time.Millisecond // Moderate minimum for high-frequency jobs
 	}
 	
 	cronJob := &CronJob{
@@ -120,9 +121,10 @@ func (m *CronManager) scheduleJobLocked(job *CronJob, ctx context.Context) {
 		delay = job.minWaitTime
 	}
 
-	// Ensure we never use a delay less than 1ms to prevent CPU thrashing
-	if delay < time.Millisecond {
-		delay = time.Millisecond
+	// Ensure we never use a delay less than 5ms to prevent CPU thrashing
+	// This will reduce precision but significantly decrease CPU load
+	if delay < 5*time.Millisecond {
+		delay = 5*time.Millisecond
 	}
 
 	// Timer callback must acquire lock before modifying shared state
@@ -154,20 +156,20 @@ func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context)
 	if m.ctx.Err() == nil && ctx.Err() == nil {
 		nextDelay := nextRunTime.Sub(now)
 		
-		// Apply minimum delay rules
+		// Apply more aggressive minimum delay rules to reduce CPU usage
 		if nextDelay < 0 {
 			// We're already behind schedule
 			if job.minWaitTime > 0 {
 				nextDelay = job.minWaitTime
 			} else {
-				nextDelay = time.Millisecond // Minimum 1ms delay
+				nextDelay = 10*time.Millisecond // Increased minimum delay
 			}
 		} else if nextDelay < job.minWaitTime && job.minWaitTime > 0 {
 			// Respect minimum wait time for high-frequency jobs
 			nextDelay = job.minWaitTime
-		} else if nextDelay < time.Millisecond {
-			// Absolute minimum delay
-			nextDelay = time.Millisecond
+		} else if nextDelay < 5*time.Millisecond {
+			// Higher absolute minimum delay to reduce CPU usage
+			nextDelay = 5*time.Millisecond
 		}
 		
 		job.timer = time.AfterFunc(nextDelay, func() {
@@ -188,7 +190,9 @@ func (m *CronManager) executeJobAndReschedule(job *CronJob, ctx context.Context)
 			// but with a reasonable minimum to prevent resource exhaustion
 			timeoutDuration := job.Interval
 			if timeoutDuration < 10*time.Millisecond {
-				timeoutDuration = 10 * time.Millisecond // Minimum reasonable timeout
+				timeoutDuration = 30 * time.Millisecond // More aggressive timeout for CPU reduction
+			} else if timeoutDuration < 100*time.Millisecond {
+				timeoutDuration = 20 * time.Millisecond // Moderate timeout for CPU reduction
 			}
 			
 			// Set a timeout that prevents long-running jobs from consuming resources indefinitely
@@ -258,6 +262,7 @@ func (m *CronManager) Start() {
 }
 
 func (m *CronManager) Stop() {
+	// First acquire the lock to stop new jobs from starting
 	m.mu.Lock()
 	
 	// Cancel the context to stop all jobs
@@ -273,8 +278,9 @@ func (m *CronManager) Stop() {
 		}
 	}
 	
+	// Release the lock so jobs can complete
 	m.mu.Unlock()
 	
-	// Wait for all running jobs to complete
+	// Wait for all running jobs to complete (outside of lock)
 	m.wg.Wait()
 }

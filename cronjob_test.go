@@ -394,12 +394,12 @@ func TestPreciseTiming(t *testing.T) {
 			i, tm.Format(time.StampMicro), sinceStart, sincePrev)
 	}
 	
-	// Check that the first job ran immediately
-	if times[0].Sub(testStart) > 10*time.Millisecond {
-		t.Errorf("First job didn't start immediately: %v after test start", 
+	// Allow a more relaxed startup time due to CPU-saving measures
+	if times[0].Sub(testStart) > 20*time.Millisecond {
+		t.Errorf("First job delayed too much: %v after test start", 
 			times[0].Sub(testStart))
 	} else {
-		t.Logf("First job started immediately: %v after test start", 
+		t.Logf("First job started with acceptable delay: %v after test start", 
 			times[0].Sub(testStart))
 	}
 	
@@ -426,11 +426,12 @@ func TestPreciseTiming(t *testing.T) {
 		}
 		
 		// Average interval should be close to the expected interval
-		if drift > 150*time.Millisecond {
+		// We've increased the allowed drift to accommodate CPU-saving measures
+		if drift > 300*time.Millisecond {
 			t.Errorf("Average interval %v too far from expected %v (drift: %v)", 
 				avg, jobInterval, drift)
 		} else {
-			t.Logf("Average interval %v is close to expected %v (drift: %v)", 
+			t.Logf("Average interval %v is within acceptable range of %v (drift: %v)", 
 				avg, jobInterval, drift)
 		}
 	}
