@@ -118,41 +118,20 @@ func TestCronManager(t *testing.T) {
 func BenchmarkCronManagerAddJob(b *testing.B) {
 	// Create a silent logger
 	logger := zerolog.New(io.Discard).With().Timestamp().Logger()
-	
+
 	// Create job function that does nothing
 	noop := func() {}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Create new cron manager for each iteration
 		manager := NewCronManager(&logger)
 		manager.Start()
-		
+
 		// Add a job
 		manager.AddCron("bench-job", noop, 100*time.Millisecond, false)
-		
+
 		// Clean up
 		manager.Stop()
-	}
-}
-
-func BenchmarkCronManagerRunJob(b *testing.B) {
-	// Create a silent logger
-	logger := zerolog.New(io.Discard).With().Timestamp().Logger()
-	
-	// Create a CronManager that will be reused
-	manager := NewCronManager(&logger)
-	
-	// Create a simple job that does minimal work
-	job := &CronJob{
-		Action:   func() {},
-		Interval: 10 * time.Millisecond,
-		Name:     "benchmark-job",
-		nextRun:  time.Now(),
-	}
-	
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		manager.runJob(job)
 	}
 }

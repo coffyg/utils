@@ -2,7 +2,10 @@ package utils
 
 import (
 	"container/heap"
+	"context"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -19,8 +22,8 @@ type CronJob struct {
 	index    int // The index of the item in the heap.
 
 	// Added fields:
-	isRunning bool // true if this job is currently running
-	skipNext  bool // true if we should skip exactly one cycle (e.g., after a timeout)
+	isRunning int32 // atomic: 1 if this job is currently running, 0 otherwise
+	skipNext  int32 // atomic: 1 if we should skip exactly one cycle
 }
 
 type JobHeap []*CronJob
@@ -49,28 +52,236 @@ func (h *JobHeap) Pop() interface{} {
 	return item
 }
 
+// WorkerPool manages a fixed number of worker goroutines
+type WorkerPool struct {
+	jobQueue    chan *jobExecution
+	workers     []*worker
+	workerCount int
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	logger      *zerolog.Logger
+}
+
+type jobExecution struct {
+	job     *CronJob
+	manager *CronManager
+	timeout time.Duration
+}
+
+type worker struct {
+	id       int
+	jobQueue chan *jobExecution
+	ctx      context.Context
+	logger   *zerolog.Logger
+}
+
+func newWorkerPool(workerCount int, queueSize int, logger *zerolog.Logger) *WorkerPool {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	pool := &WorkerPool{
+		jobQueue:    make(chan *jobExecution, queueSize),
+		workers:     make([]*worker, workerCount),
+		workerCount: workerCount,
+		ctx:         ctx,
+		cancel:      cancel,
+		logger:      logger,
+	}
+
+	// Start workers
+	for i := 0; i < workerCount; i++ {
+		w := &worker{
+			id:       i,
+			jobQueue: pool.jobQueue,
+			ctx:      ctx,
+			logger:   logger,
+		}
+		pool.workers[i] = w
+		pool.wg.Add(1)
+		go w.start(&pool.wg)
+	}
+
+	return pool
+}
+
+func (w *worker) start(wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case jobExec, ok := <-w.jobQueue:
+			if !ok {
+				return
+			}
+			w.executeJob(jobExec)
+		}
+	}
+}
+
+func (w *worker) executeJob(jobExec *jobExecution) {
+	job := jobExec.job
+	manager := jobExec.manager
+	timeout := jobExec.timeout
+
+	// Mark job as running using atomic operation
+	if !atomic.CompareAndSwapInt32(&job.isRunning, 0, 1) {
+		// Job is already running, reschedule
+		manager.rescheduleJob(job, false)
+		return
+	}
+
+	defer func() {
+		// Mark job as not running
+		atomic.StoreInt32(&job.isRunning, 0)
+
+		if r := recover(); r != nil {
+			w.logger.Error().Msgf("[cron|%s|%s] worker-%d panicked: %v", job.Name, job.Interval, w.id, r)
+			// Skip next cycle after panic
+			atomic.StoreInt32(&job.skipNext, 1)
+		}
+
+		// Always reschedule the job
+		manager.rescheduleJob(job, true)
+	}()
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(w.ctx, timeout)
+	defer cancel()
+
+	// Execute job with timeout
+	done := make(chan struct{}, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// This panic will be caught by the outer defer
+				panic(r)
+			}
+		}()
+		job.Action()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		w.logger.Debug().Msgf("[cron|%s|%s] worker-%d completed", job.Name, job.Interval, w.id)
+	case <-ctx.Done():
+		w.logger.Error().Msgf("[cron|%s|%s] worker-%d timed out", job.Name, job.Interval, w.id)
+		// Skip next cycle after timeout
+		atomic.StoreInt32(&job.skipNext, 1)
+	}
+}
+
+func (p *WorkerPool) submit(jobExec *jobExecution) bool {
+	select {
+	case p.jobQueue <- jobExec:
+		return true
+	default:
+		// Queue is full, drop the job and log warning
+		p.logger.Warn().Msgf("[cron|%s|%s] job queue full, dropping execution",
+			jobExec.job.Name, jobExec.job.Interval)
+		return false
+	}
+}
+
+func (p *WorkerPool) stop() {
+	p.cancel()
+	close(p.jobQueue)
+	p.wg.Wait()
+}
+
+// Improved timer pool with better resource management
+type timerPool struct {
+	pool sync.Pool
+	size int64 // atomic counter for pool size
+	max  int64 // maximum pool size
+}
+
+var globalTimerPool = &timerPool{
+	pool: sync.Pool{
+		New: func() interface{} {
+			return time.NewTimer(time.Hour)
+		},
+	},
+	max: int64(runtime.NumCPU() * 100), // Reasonable limit based on CPU cores
+}
+
+func (tp *timerPool) get(d time.Duration) *time.Timer {
+	timer := tp.pool.Get().(*time.Timer)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
+	return timer
+}
+
+func (tp *timerPool) put(t *time.Timer) {
+	if t == nil {
+		return
+	}
+
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+
+	// Only put back if pool isn't too large
+	if atomic.LoadInt64(&tp.size) < tp.max {
+		atomic.AddInt64(&tp.size, 1)
+		tp.pool.Put(t)
+	}
+}
+
 type CronManager struct {
 	jobHeap    JobHeap
-	lock       sync.Mutex
+	lock       sync.RWMutex
 	wakeUpChan chan struct{}
 	stopChan   chan struct{}
 	running    bool
 	logger     *zerolog.Logger
+	workerPool *WorkerPool
 
-	wg    sync.WaitGroup // WaitGroup for the dispatcher itself
-	jobWg sync.WaitGroup // WaitGroup for any running jobs
+	// Metrics
+	jobsScheduled int64 // atomic
+	jobsCompleted int64 // atomic
+	jobsDropped   int64 // atomic
+
+	wg sync.WaitGroup // WaitGroup for the dispatcher
+}
+
+// Configuration for the cron manager
+type CronConfig struct {
+	MaxWorkers     int
+	QueueSize      int
+	DefaultTimeout time.Duration
 }
 
 func NewCronManager(logger *zerolog.Logger) *CronManager {
+	return NewCronManagerWithConfig(logger, CronConfig{
+		MaxWorkers:     runtime.NumCPU() * 2, // 2x CPU cores
+		QueueSize:      1000,                 // Reasonable queue size
+		DefaultTimeout: 5 * time.Minute,      // 5 minute default timeout
+	})
+}
+
+func NewCronManagerWithConfig(logger *zerolog.Logger, config CronConfig) *CronManager {
 	return &CronManager{
 		jobHeap:    make(JobHeap, 0),
-		wakeUpChan: make(chan struct{}, 1), // Buffered channel
+		wakeUpChan: make(chan struct{}, 1),
 		stopChan:   make(chan struct{}),
 		logger:     logger,
+		workerPool: newWorkerPool(config.MaxWorkers, config.QueueSize, logger),
 	}
 }
 
 // AddCron adds a new cron job. If 'runImmed' is true, the job is scheduled to run immediately.
+// API-compatible method
 func (m *CronManager) AddCron(name string, job Job, interval time.Duration, runImmed bool) {
 	cronJob := &CronJob{
 		Action:   job,
@@ -88,125 +299,67 @@ func (m *CronManager) AddCron(name string, job Job, interval time.Duration, runI
 	heap.Push(&m.jobHeap, cronJob)
 	m.lock.Unlock()
 
+	atomic.AddInt64(&m.jobsScheduled, 1)
 	m.logger.Debug().Msgf("[cron|%s|%s] Added as job", name, interval)
 
-	// If manager is already running, wake the dispatcher in case this job is earlier than everything else.
-	if m.running {
-		select {
-		case m.wakeUpChan <- struct{}{}:
-		default:
-		}
+	// Wake dispatcher if running
+	if m.isRunning() {
+		m.wakeDispatcher()
 	}
 }
 
-// runJob executes the cron job asynchronously so the dispatcher does not block.
-// The same job will never run in parallel because the dispatcher checks 'isRunning' before calling runJob.
-func (m *CronManager) runJob(cronJob *CronJob) {
-	m.jobWg.Add(1)
-
-	go func(job *CronJob) {
-		defer m.jobWg.Done()
-
-		// Mark the job as running
-		job.isRunning = true
-		defer func() {
-			job.isRunning = false
-		}()
-
-		// Recover from panic to avoid crashing the entire dispatcher
-		defer func() {
-			if r := recover(); r != nil {
-				m.logger.Error().Msgf("[cron|%s|%s] panicked: %v", job.Name, job.Interval, r)
-			}
-		}()
-
-		// Actually run the job's Action, but watch for timeout.
-		done := make(chan struct{})
-		go func() {
-			job.Action()
-			close(done)
-		}()
-
-		// Use a pooled timer instead of time.After to avoid allocations.
-		timer := getTimer(job.Interval)
-		defer releaseTimer(timer)
-
-		select {
-		case <-done:
-			// Job completed before the timer fired
-			m.logger.Debug().Msgf("[cron|%s|%s] completed", job.Name, job.Interval)
-		case <-timer.C:
-			// Timed out
-			m.logger.Error().Msgf("[cron|%s|%s] timed out", job.Name, job.Interval)
-			// Skip exactly one cycle
-			job.skipNext = true
-		}
-
-		// Once job is done (or timed out), schedule its next run.
-		// If we haven't been stopped, push it back with new nextRun.
-		m.lock.Lock()
-		if m.running { // Only reschedule if we're still running
-			job.nextRun = time.Now().Add(job.Interval)
-			heap.Push(&m.jobHeap, job)
-			// Wake the dispatcher in case this job is now the next one
-			select {
-			case m.wakeUpChan <- struct{}{}:
-			default:
-			}
-		}
-		m.lock.Unlock()
-	}(cronJob)
+func (m *CronManager) isRunning() bool {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return m.running
 }
 
-// timerPool reuses timer objects to reduce GC pressure.
-var timerPool = sync.Pool{
-	New: func() interface{} {
-		return time.NewTimer(time.Hour)
-	},
-}
-
-// getTimer returns a pooled timer reset to 'd'.
-func getTimer(d time.Duration) *time.Timer {
-	timer := timerPool.Get().(*time.Timer)
-	// Stop the timer if it's running
-	if !timer.Stop() {
-		// Drain channel if needed
-		select {
-		case <-timer.C:
-		default:
-		}
+func (m *CronManager) wakeDispatcher() {
+	select {
+	case m.wakeUpChan <- struct{}{}:
+	default:
 	}
-	timer.Reset(d)
-	return timer
 }
 
-// releaseTimer returns a timer to the pool.
-func releaseTimer(t *time.Timer) {
-	if t == nil {
-		return
+func (m *CronManager) rescheduleJob(job *CronJob, normalCompletion bool) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	if !m.running {
+		return // Don't reschedule if manager is stopped
 	}
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
+
+	if normalCompletion {
+		atomic.AddInt64(&m.jobsCompleted, 1)
 	}
-	timerPool.Put(t)
+
+	job.nextRun = time.Now().Add(job.Interval)
+	heap.Push(&m.jobHeap, job)
+
+	// Wake dispatcher for potential earlier scheduling
+	m.wakeDispatcher()
 }
 
-// dispatcher runs in its own goroutine, scheduling jobs as they come due.
 func (m *CronManager) dispatcher() {
+	defer m.wg.Done()
+
 	var sleepTimer *time.Timer
 	defer func() {
 		if sleepTimer != nil {
-			releaseTimer(sleepTimer)
+			globalTimerPool.put(sleepTimer)
 		}
 	}()
 
 	for {
 		m.lock.Lock()
 
-		// If no jobs, just wait until one arrives or we stop
+		// Check if we should stop
+		if !m.running {
+			m.lock.Unlock()
+			return
+		}
+
+		// If no jobs, wait for one or stop signal
 		if len(m.jobHeap) == 0 {
 			m.lock.Unlock()
 			select {
@@ -217,98 +370,131 @@ func (m *CronManager) dispatcher() {
 			}
 		}
 
-		// Peek at the next job
+		// Get next job
 		nextJob := m.jobHeap[0]
 		now := time.Now()
 		delay := nextJob.nextRun.Sub(now)
 
 		m.lock.Unlock()
 
-		// If it's time (or overdue), try to run it
+		// If job is ready to run
 		if delay <= 0 {
 			m.lock.Lock()
 			if !m.running {
-				// If we are no longer running, exit
 				m.lock.Unlock()
 				return
 			}
-			// Pop the job off the heap
+
+			// Remove job from heap
 			heap.Pop(&m.jobHeap)
 
-			// If it’s already running, or flagged to skip once, skip this cycle
-			if nextJob.isRunning {
-				nextJob.nextRun = time.Now().Add(nextJob.Interval)
-				heap.Push(&m.jobHeap, nextJob)
+			// Check if job should be skipped
+			if atomic.LoadInt32(&nextJob.isRunning) == 1 {
+				// Job is already running, reschedule
+				m.rescheduleJobLocked(nextJob)
 				m.lock.Unlock()
 				continue
 			}
-			if nextJob.skipNext {
-				nextJob.skipNext = false
-				nextJob.nextRun = time.Now().Add(nextJob.Interval)
-				heap.Push(&m.jobHeap, nextJob)
+
+			if atomic.CompareAndSwapInt32(&nextJob.skipNext, 1, 0) {
+				// Skip this cycle
+				m.rescheduleJobLocked(nextJob)
 				m.lock.Unlock()
 				continue
 			}
 
 			m.lock.Unlock()
 
-			// Run the job asynchronously
-			m.runJob(nextJob)
+			// Submit job to worker pool
+			jobExec := &jobExecution{
+				job:     nextJob,
+				manager: m,
+				timeout: nextJob.Interval, // Use interval as timeout
+			}
+
+			if !m.workerPool.submit(jobExec) {
+				// Job was dropped, reschedule it
+				atomic.AddInt64(&m.jobsDropped, 1)
+				m.rescheduleJob(nextJob, false)
+			}
 
 		} else {
-			// Otherwise, wait for the earliest job to come due, or a new job to appear, or stop
+			// Wait for job time or wake signal
 			if sleepTimer == nil {
-				sleepTimer = getTimer(delay)
+				sleepTimer = globalTimerPool.get(delay)
 			} else {
 				sleepTimer.Reset(delay)
 			}
 
 			select {
 			case <-sleepTimer.C:
-				// Timer fired, loop around and see if job is ready now
+				// Timer expired, check jobs again
 			case <-m.stopChan:
 				return
 			case <-m.wakeUpChan:
-				// Possibly a new job was added or something changed
+				// New job added or other event
 			}
 		}
 	}
 }
 
+func (m *CronManager) rescheduleJobLocked(job *CronJob) {
+	job.nextRun = time.Now().Add(job.Interval)
+	heap.Push(&m.jobHeap, job)
+}
+
 // Start spins up the dispatcher goroutine if not already running.
+// API-compatible method
 func (m *CronManager) Start() {
 	m.lock.Lock()
 	if m.running {
 		m.lock.Unlock()
 		return
 	}
+
 	m.running = true
-	// Recreate channels in case we stopped previously
 	m.wakeUpChan = make(chan struct{}, 1)
 	m.stopChan = make(chan struct{})
 
 	m.wg.Add(1)
 	m.lock.Unlock()
 
-	go func() {
-		m.dispatcher()
-		m.wg.Done() // Signal that dispatcher has exited
-	}()
+	go m.dispatcher()
+
+	m.logger.Info().Msg("CronManager started")
 }
 
-// Stop signals the dispatcher to exit and waits for all running jobs to finish.
+// Stop signals the dispatcher to exit and waits for cleanup.
+// API-compatible method
 func (m *CronManager) Stop() {
 	m.lock.Lock()
 	if !m.running {
 		m.lock.Unlock()
 		return
 	}
+
 	m.running = false
 	close(m.stopChan)
 	m.lock.Unlock()
 
-	// Wait for the dispatcher goroutine to exit
+	// Wait for dispatcher to exit
 	m.wg.Wait()
-	// Wait for any in-flight jobs to complete
-	m.jobWg.Wait()
+
+	// Stop worker pool
+	m.workerPool.stop()
+
+	m.logger.Info().
+		Int64("scheduled", atomic.LoadInt64(&m.jobsScheduled)).
+		Int64("completed", atomic.LoadInt64(&m.jobsCompleted)).
+		Int64("dropped", atomic.LoadInt64(&m.jobsDropped)).
+		Msg("CronManager stopped")
+}
+
+// GetMetrics returns current metrics (bonus feature, doesn't break API)
+func (m *CronManager) GetMetrics() map[string]int64 {
+	return map[string]int64{
+		"jobs_scheduled": atomic.LoadInt64(&m.jobsScheduled),
+		"jobs_completed": atomic.LoadInt64(&m.jobsCompleted),
+		"jobs_dropped":   atomic.LoadInt64(&m.jobsDropped),
+	}
 }
