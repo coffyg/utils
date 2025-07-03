@@ -42,6 +42,8 @@ type Monitor struct {
 	startOnce     sync.Once
 	stopOnce      sync.Once
 	config        MonitorConfig
+	callbackChan  chan Metrics
+	callbackWorkersDone sync.WaitGroup
 
 	// Cached values with timestamps for intelligent refresh
 	cachedMetrics    Metrics
@@ -123,6 +125,7 @@ func NewMonitorWithConfig(interval time.Duration, onMetrics func(Metrics), confi
 		cpuStats: CPUStats{
 			lastCheckTime: time.Now(),
 		},
+		callbackChan:  make(chan Metrics, 10), // Buffer for smooth operation
 	}
 }
 
@@ -131,6 +134,10 @@ func NewMonitorWithConfig(interval time.Duration, onMetrics func(Metrics), confi
 func (m *Monitor) Start() {
 	m.startOnce.Do(func() {
 		m.stoppedChan = make(chan struct{})
+
+		// Start callback worker
+		m.callbackWorkersDone.Add(1)
+		go m.callbackWorker()
 
 		go func() {
 			ticker := time.NewTicker(m.interval)
@@ -142,11 +149,27 @@ func (m *Monitor) Start() {
 				case <-ticker.C:
 					m.handleTick()
 				case <-m.stopChan:
+					close(m.callbackChan) // Signal callback worker to stop
 					return
 				}
 			}
 		}()
 	})
+}
+
+func (m *Monitor) callbackWorker() {
+	defer m.callbackWorkersDone.Done()
+	
+	for metrics := range m.callbackChan {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Callback panicked, but don't crash the monitor
+				}
+			}()
+			m.onMetricsFunc(metrics)
+		}()
+	}
 }
 
 func (m *Monitor) handleTick() {
@@ -163,15 +186,13 @@ func (m *Monitor) handleTick() {
 		atomic.StoreInt64(&m.lastCallbackTime, now.UnixNano())
 		atomic.AddInt64(&m.callbacksInvoked, 1)
 
-		// Run callback in separate goroutine to prevent blocking
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Callback panicked, but don't crash the monitor
-				}
-			}()
-			m.onMetricsFunc(metrics)
-		}()
+		// Send to callback worker, non-blocking
+		select {
+		case m.callbackChan <- metrics:
+			// Sent successfully
+		default:
+			// Channel full, skip this callback
+		}
 	}
 }
 
@@ -182,6 +203,12 @@ func (m *Monitor) Stop() {
 		close(m.stopChan)
 		if m.stoppedChan != nil {
 			<-m.stoppedChan
+		}
+		// Wait for callback worker to finish
+		m.callbackWorkersDone.Wait()
+		// Clean up FD cache if enabled
+		if m.config.EnableFDMonitoring {
+			cleanupOptimizedFDCache()
 		}
 	})
 }

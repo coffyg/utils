@@ -159,6 +159,12 @@ func (w *worker) executeJob(jobExec *jobExecution) {
 				panic(r)
 			}
 		}()
+		// Check if context is already cancelled before starting
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		job.Action()
 		close(done)
 	}()

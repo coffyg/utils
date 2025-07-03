@@ -85,24 +85,6 @@ func (m *RedisSafeMap[V]) getClient() *redis.Client {
 	return redisClient
 }
 
-// getPipeline returns a pipeline for the given client
-func (m *RedisSafeMap[V]) getPipeline() redis.Pipeliner {
-	// Try to get a pipeline from the pool
-	if pipeObj := redisPipelinePool.Get(); pipeObj != nil {
-		pipe := pipeObj.(redis.Pipeliner)
-		return pipe
-	}
-	
-	// Create a new pipeline if none available
-	return m.getClient().Pipeline()
-}
-
-// releasePipeline returns a pipeline to the pool after use
-func (m *RedisSafeMap[V]) releasePipeline(pipe redis.Pipeliner) {
-	// Clear any remaining commands
-	pipe.Discard()
-	redisPipelinePool.Put(pipe)
-}
 
 // Build the actual Redis key: prefix + ":" + userKey
 func (m *RedisSafeMap[V]) buildKey(key string) string {
@@ -131,14 +113,6 @@ var (
 		New: func() interface{} {
 			// Create a reasonably sized buffer for most operations
 			return make([]byte, 256)
-		},
-	}
-	
-	// Pool of Redis pipelines to reduce connection overhead
-	redisPipelinePool = sync.Pool{
-		New: func() interface{} {
-			// Return nil - we can't create a pipeline yet as we don't know which client will be used
-			return nil
 		},
 	}
 )
@@ -424,18 +398,18 @@ func (m *RedisSafeMap[V]) Len() int {
 		}
 
 		// Pipeline an EXISTS for each key
-		existsPipe := m.getPipeline()
+		existsPipe := m.getClient().Pipeline()
 		existsCmds := make([]*redis.IntCmd, len(keys))
 		for i, k := range keys {
 			existsCmds[i] = existsPipe.Exists(ctx, m.buildKey(k))
 		}
 		_, _ = existsPipe.Exec(ctx)
 		
-		// Return pipeline to the pool
-		m.releasePipeline(existsPipe)
+		// Discard pipeline
+		existsPipe.Discard()
 
 		// Pipeline for removing stale
-		removePipe := m.getPipeline()
+		removePipe := m.getClient().Pipeline()
 		staleCount := 0
 		for i, k := range keys {
 			ex, _ := existsCmds[i].Result()
@@ -450,10 +424,10 @@ func (m *RedisSafeMap[V]) Len() int {
 		}
 		if staleCount > 0 {
 			_, _ = removePipe.Exec(ctx)
-			m.releasePipeline(removePipe)
+			removePipe.Discard()
 		} else {
 			// No stale keys to remove, just return the pipeline
-			m.releasePipeline(removePipe)
+			removePipe.Discard()
 		}
 
 		cursor = cur
@@ -485,16 +459,16 @@ func (m *RedisSafeMap[V]) Keys() []string {
 		}
 
 		// Pipeline an EXISTS for each
-		existsPipe := m.getPipeline()
+		existsPipe := m.getClient().Pipeline()
 		existsCmds := make([]*redis.IntCmd, len(keys))
 		for i, k := range keys {
 			existsCmds[i] = existsPipe.Exists(ctx, m.buildKey(k))
 		}
 		_, _ = existsPipe.Exec(ctx)
-		m.releasePipeline(existsPipe)
+		existsPipe.Discard()
 
 		// Another pipeline to remove stales
-		removePipe := m.getPipeline()
+		removePipe := m.getClient().Pipeline()
 		staleCount := 0
 		for i, k := range keys {
 			ex, _ := existsCmds[i].Result()
@@ -510,7 +484,7 @@ func (m *RedisSafeMap[V]) Keys() []string {
 		if staleCount > 0 {
 			_, _ = removePipe.Exec(ctx)
 		}
-		m.releasePipeline(removePipe)
+		removePipe.Discard()
 
 		cursor = cur
 		if cursor == 0 {
@@ -542,16 +516,16 @@ func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
 		}
 
 		// We'll pipeline GET calls for each key
-		getPipe := m.getPipeline()
+		getPipe := m.getClient().Pipeline()
 		getCmds := make([]*redis.StringCmd, len(keys))
 		for i, k := range keys {
 			getCmds[i] = getPipe.Get(ctx, m.buildKey(k))
 		}
 		_, _ = getPipe.Exec(ctx)
-		m.releasePipeline(getPipe)
+		getPipe.Discard()
 
 		// Another pipeline to remove stales
-		removePipe := m.getPipeline()
+		removePipe := m.getClient().Pipeline()
 		staleCount := 0
 
 		// Process the results
@@ -584,7 +558,7 @@ func (m *RedisSafeMap[V]) Range(f func(key string, value V) bool) {
 		if staleCount > 0 {
 			_, _ = removePipe.Exec(ctx)
 		}
-		m.releasePipeline(removePipe)
+		removePipe.Discard()
 		
 		if !continueIteration {
 			return

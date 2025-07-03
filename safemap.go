@@ -451,47 +451,40 @@ func (s *mapShard[V]) delete(key string) {
 func (sm *SafeMap[V]) Range(f func(key string, value V) bool) {
 	now := time.Now().UnixNano()
 	
-	// Store keys and values temporarily to prevent holding locks during callback
-	type keyValuePair struct {
-		key   string
-		value V
-	}
-	
 	// Process each shard
 	for _, shard := range sm.shards {
-		var pairs []keyValuePair
-		
-		// First collect entries from read-only map without locking
-		readOnly := shard.readOnly.Load().(readOnlyMap[V])
-		for k, entry := range readOnly.m {
+		// Create a function to process entries
+		processEntry := func(k string, entry *mapEntry[V]) bool {
 			if !isExpired(entry, now) {
 				value := entry.value.Load().(V)
-				pairs = append(pairs, keyValuePair{k, value})
+				return f(k, value)
+			}
+			return true
+		}
+		
+		// First process entries from read-only map without locking
+		readOnly := shard.readOnly.Load().(readOnlyMap[V])
+		for k, entry := range readOnly.m {
+			if !processEntry(k, entry) {
+				return
 			}
 		}
 		
 		// Process entries from dirty map if needed
 		if readOnly.amended {
 			shard.mu.Lock()
+			// Process dirty entries while holding lock
 			if shard.dirty != nil {
-				// To avoid duplicates, only add entries not in read-only map
 				for k, entry := range shard.dirty {
 					if _, exists := readOnly.m[k]; !exists {
-						if !isExpired(entry, now) {
-							value := entry.value.Load().(V)
-							pairs = append(pairs, keyValuePair{k, value})
+						if !processEntry(k, entry) {
+							shard.mu.Unlock()
+							return
 						}
 					}
 				}
 			}
 			shard.mu.Unlock()
-		}
-		
-		// Process all entries without holding locks
-		for _, pair := range pairs {
-			if !f(pair.key, pair.value) {
-				return
-			}
 		}
 	}
 }
@@ -565,48 +558,50 @@ func (sm *SafeMap[V]) UpdateExpireTime(key string, expireDuration time.Duration)
 
 // DeleteAllKeysStartingWith deletes all keys with the given prefix.
 func (sm *SafeMap[V]) DeleteAllKeysStartingWith(prefix string) {
-	// We need to lock each shard while deleting, one at a time
+	// Process each shard
 	for _, shard := range sm.shards {
-		// Acquire lock for this shard
-		shard.mu.Lock()
-
-		// With lock held, identify keys with the prefix and delete them directly
-		// First, ensure we have a dirty map
-		if shard.dirty == nil {
-			shard.dirtyLocked()
-		}
-		
-		// We need to mark the readOnly map as amended since we're making changes
+		// First, collect keys to delete from read-only map without holding lock
 		readOnly := shard.readOnly.Load().(readOnlyMap[V])
-		if !readOnly.amended {
-			shard.readOnly.Store(readOnlyMap[V]{m: readOnly.m, amended: true})
-		}
+		var keysToDelete []string
 		
-		// Delete keys from readOnly map by removing them from dirty
-		// (they will be gone after the next promotion)
+		// Identify keys to delete from readOnly map
 		for k := range readOnly.m {
 			if strings.HasPrefix(k, prefix) {
-				delete(shard.dirty, k)
+				keysToDelete = append(keysToDelete, k)
 			}
 		}
 		
-		// Delete keys directly from dirty map
-		// (including any that weren't in readOnly)
-		for k := range shard.dirty {
-			if strings.HasPrefix(k, prefix) {
+		// Only lock if we have keys to delete or if dirty map exists
+		if len(keysToDelete) > 0 || readOnly.amended {
+			shard.mu.Lock()
+			
+			// Delete the collected keys
+			for _, k := range keysToDelete {
+				// Ensure we have a dirty map
+				if shard.dirty == nil {
+					shard.dirtyLocked()
+				}
+				// Mark as deleted in dirty map
 				delete(shard.dirty, k)
 			}
+			
+			// Also check dirty map for additional keys
+			if shard.dirty != nil {
+				// Collect dirty keys to avoid modifying map during iteration
+				var dirtyKeysToDelete []string
+				for k := range shard.dirty {
+					if strings.HasPrefix(k, prefix) {
+						dirtyKeysToDelete = append(dirtyKeysToDelete, k)
+					}
+				}
+				// Delete dirty keys
+				for _, k := range dirtyKeysToDelete {
+					delete(shard.dirty, k)
+				}
+			}
+			
+			shard.mu.Unlock()
 		}
-		
-		// Immediately promote the changes to ensure consistency
-		// This is the key difference - we force promotion EVERY time
-		readOnly = readOnlyMap[V]{m: shard.dirty}
-		shard.readOnly.Store(readOnly)
-		shard.dirty = nil
-		shard.misses.Store(0)
-		
-		// Release the lock for this shard
-		shard.mu.Unlock()
 	}
 }
 
