@@ -147,47 +147,39 @@ func (w *worker) executeJob(jobExec *jobExecution) {
 
 	// The dispatcher already set isRunning, no need to check again
 
-	defer func() {
-		if r := recover(); r != nil {
-			w.logger.Error().Msgf("[cron|%s|%s] worker-%d panicked: %v", job.Name, job.Interval, w.id, r)
-			// Skip next cycle after panic
-			atomic.StoreInt32(&job.skipNext, 1)
-		}
-
-		// Reschedule job (this will also clear isRunning under lock)
-		manager.rescheduleJob(job)
-	}()
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(w.ctx, timeout)
-	defer cancel()
-
 	// Execute job with timeout
 	done := make(chan struct{}, 1)
+	
+	// Launch job in goroutine
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				// This panic will be caught by the outer defer
-				panic(r)
+				w.logger.Error().Msgf("[cron|%s|%s] worker-%d panicked: %v", job.Name, job.Interval, w.id, r)
+				// Skip next cycle after panic
+				atomic.StoreInt32(&job.skipNext, 1)
 			}
+			// ALWAYS reschedule when the goroutine completes, not when it times out
+			manager.rescheduleJob(job)
+			close(done)
 		}()
-		// Check if context is already cancelled before starting
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+		
 		job.Action()
-		close(done)
 	}()
+
+	// Create context with timeout for monitoring only
+	ctx, cancel := context.WithTimeout(w.ctx, timeout)
+	defer cancel()
 
 	select {
 	case <-done:
 		w.logger.Debug().Msgf("[cron|%s|%s] worker-%d completed", job.Name, job.Interval, w.id)
 	case <-ctx.Done():
-		w.logger.Error().Msgf("[cron|%s|%s] worker-%d timed out", job.Name, job.Interval, w.id)
+		w.logger.Error().Msgf("[cron|%s|%s] worker-%d timed out (job still running)", job.Name, job.Interval, w.id)
 		// Skip next cycle after timeout
 		atomic.StoreInt32(&job.skipNext, 1)
+		// Wait for the job to actually complete before returning
+		<-done
+		w.logger.Debug().Msgf("[cron|%s|%s] worker-%d timed out job finally completed", job.Name, job.Interval, w.id)
 	}
 }
 
@@ -379,6 +371,10 @@ func (m *CronManager) rescheduleJob(job *CronJob) {
 
 		// Wake dispatcher for potential earlier scheduling
 		m.wakeDispatcher()
+	} else {
+		// Job is already in heap - this shouldn't happen if our logic is correct
+		m.logger.Warn().Msgf("[cron|%s|%s] rescheduleJob called but job already in heap!", 
+			job.Name, job.Interval)
 	}
 }
 
@@ -433,35 +429,28 @@ func (m *CronManager) dispatcher() {
 				continue
 			}
 
-			// Double-check if job should be skipped
+			// Check if job is already running BEFORE trying to claim it
 			if atomic.LoadInt32(&nextJob.isRunning) == 1 {
-				// Job is already running, skip this cycle
-				nextJob.nextRun = time.Now().Add(nextJob.Interval)
-				heap.Fix(&m.jobHeap, 0)
+				// Job is still running from a previous execution
+				// Remove it from heap - it will be re-added when current execution completes
+				heap.Pop(&m.jobHeap)
+				atomic.StoreInt32(&nextJob.inHeap, 0)
 				m.lock.Unlock()
 				continue
 			}
 
-			if atomic.CompareAndSwapInt32(&nextJob.skipNext, 1, 0) {
-				// Skip this cycle
-				nextJob.nextRun = time.Now().Add(nextJob.Interval)
-				heap.Fix(&m.jobHeap, 0)
-				m.lock.Unlock()
-				continue
-			}
-
-			// Check if job is already running (without removing from heap yet)
-			if atomic.LoadInt32(&nextJob.isRunning) == 1 {
-				// Job is still running, update next run time in heap
-				nextJob.nextRun = time.Now().Add(nextJob.Interval)
-				heap.Fix(&m.jobHeap, 0)
-				m.lock.Unlock()
-				continue
-			}
-			
-			// Now try to atomically transition from not-running to running
+			// Try to atomically transition from not-running to running
 			if !atomic.CompareAndSwapInt32(&nextJob.isRunning, 0, 1) {
-				// Another goroutine just started running this job
+				// Another dispatcher iteration grabbed it between our check and CAS
+				// This is rare but possible - just continue
+				m.lock.Unlock()
+				continue
+			}
+
+			// Check if we should skip this cycle
+			if atomic.CompareAndSwapInt32(&nextJob.skipNext, 1, 0) {
+				// Skip this cycle but we already set isRunning, so clear it
+				atomic.StoreInt32(&nextJob.isRunning, 0)
 				nextJob.nextRun = time.Now().Add(nextJob.Interval)
 				heap.Fix(&m.jobHeap, 0)
 				m.lock.Unlock()
