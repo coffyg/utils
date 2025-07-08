@@ -3,6 +3,7 @@ package utils
 import (
 	"container/heap"
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,15 @@ type CronJob struct {
 	// Added fields:
 	isRunning int32 // atomic: 1 if this job is currently running, 0 otherwise
 	skipNext  int32 // atomic: 1 if we should skip exactly one cycle
+	
+	// NEW: Add unique ID and tracking to prevent double scheduling
+	id         string // Unique identifier for this job instance
+	inHeap     int32  // atomic: 1 if job is currently in heap, 0 otherwise
+	generation int64  // atomic: increment on each reschedule to detect stale entries
+	
+	// State: 0=idle, 1=scheduled_in_heap, 2=running
+	// Transitions: 0->1 (schedule), 1->2 (start), 2->0 (complete)
+	state int32
 }
 
 type JobHeap []*CronJob
@@ -64,9 +74,10 @@ type WorkerPool struct {
 }
 
 type jobExecution struct {
-	job     *CronJob
-	manager *CronManager
-	timeout time.Duration
+	job        *CronJob
+	manager    *CronManager
+	timeout    time.Duration
+	generation int64 // Track which generation this execution is for
 }
 
 type worker struct {
@@ -124,26 +135,27 @@ func (w *worker) executeJob(jobExec *jobExecution) {
 	job := jobExec.job
 	manager := jobExec.manager
 	timeout := jobExec.timeout
+	generation := jobExec.generation
 
-	// Mark job as running using atomic operation
-	if !atomic.CompareAndSwapInt32(&job.isRunning, 0, 1) {
-		// Job is already running, reschedule
-		manager.rescheduleJob(job, false)
+	// Check if this is a stale execution
+	if atomic.LoadInt64(&job.generation) != generation {
+		w.logger.Debug().Msgf("[cron|%s|%s] worker-%d skipping stale execution", job.Name, job.Interval, w.id)
+		// Make sure to clear isRunning if it was set by dispatcher
+		atomic.StoreInt32(&job.isRunning, 0)
 		return
 	}
 
-	defer func() {
-		// Mark job as not running
-		atomic.StoreInt32(&job.isRunning, 0)
+	// The dispatcher already set isRunning, no need to check again
 
+	defer func() {
 		if r := recover(); r != nil {
 			w.logger.Error().Msgf("[cron|%s|%s] worker-%d panicked: %v", job.Name, job.Interval, w.id, r)
 			// Skip next cycle after panic
 			atomic.StoreInt32(&job.skipNext, 1)
 		}
 
-		// Always reschedule the job
-		manager.rescheduleJob(job, true)
+		// Reschedule job (this will also clear isRunning under lock)
+		manager.rescheduleJob(job)
 	}()
 
 	// Create context with timeout
@@ -259,6 +271,10 @@ type CronManager struct {
 	jobsDropped   int64 // atomic
 
 	wg sync.WaitGroup // WaitGroup for the dispatcher
+	
+	// NEW: Track jobs by ID to prevent duplicates
+	jobsByID map[string]*CronJob
+	idCounter int64 // atomic counter for generating unique IDs
 }
 
 // Configuration for the cron manager
@@ -283,30 +299,41 @@ func NewCronManagerWithConfig(logger *zerolog.Logger, config CronConfig) *CronMa
 		stopChan:   make(chan struct{}),
 		logger:     logger,
 		workerPool: newWorkerPool(config.MaxWorkers, config.QueueSize, logger),
+		jobsByID:   make(map[string]*CronJob),
 	}
 }
 
 // AddCron adds a new cron job. If 'runImmed' is true, the job is scheduled to run immediately.
 // API-compatible method
 func (m *CronManager) AddCron(name string, job Job, interval time.Duration, runImmed bool) {
+	// Generate unique ID for this job
+	id := fmt.Sprintf("%s-%d-%d", name, time.Now().UnixNano(), atomic.AddInt64(&m.idCounter, 1))
+	
 	cronJob := &CronJob{
 		Action:   job,
 		Interval: interval,
 		RunImmed: runImmed,
 		Name:     name,
+		id:       id,
 	}
 
 	m.lock.Lock()
+	// Store job by ID
+	m.jobsByID[id] = cronJob
+	
 	if runImmed {
 		cronJob.nextRun = time.Now()
 	} else {
 		cronJob.nextRun = time.Now().Add(interval)
 	}
+	
+	// Mark as in heap before pushing
+	atomic.StoreInt32(&cronJob.inHeap, 1)
 	heap.Push(&m.jobHeap, cronJob)
 	m.lock.Unlock()
 
 	atomic.AddInt64(&m.jobsScheduled, 1)
-	m.logger.Debug().Msgf("[cron|%s|%s] Added as job", name, interval)
+	m.logger.Debug().Msgf("[cron|%s|%s] Added as job with ID %s", name, interval, id)
 
 	// Wake dispatcher if running
 	if m.isRunning() {
@@ -327,7 +354,7 @@ func (m *CronManager) wakeDispatcher() {
 	}
 }
 
-func (m *CronManager) rescheduleJob(job *CronJob, normalCompletion bool) {
+func (m *CronManager) rescheduleJob(job *CronJob) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -335,15 +362,24 @@ func (m *CronManager) rescheduleJob(job *CronJob, normalCompletion bool) {
 		return // Don't reschedule if manager is stopped
 	}
 
-	if normalCompletion {
+	// Clear isRunning under lock to prevent race with dispatcher
+	atomic.StoreInt32(&job.isRunning, 0)
+
+	// Increment generation to invalidate any pending executions
+	atomic.AddInt64(&job.generation, 1)
+
+	// Only reschedule if not already in heap
+	if atomic.CompareAndSwapInt32(&job.inHeap, 0, 1) {
 		atomic.AddInt64(&m.jobsCompleted, 1)
+		
+		// Add a small buffer to prevent immediate re-execution
+		// This ensures the job cannot be picked up in the same millisecond
+		job.nextRun = time.Now().Add(job.Interval).Add(time.Millisecond)
+		heap.Push(&m.jobHeap, job)
+
+		// Wake dispatcher for potential earlier scheduling
+		m.wakeDispatcher()
 	}
-
-	job.nextRun = time.Now().Add(job.Interval)
-	heap.Push(&m.jobHeap, job)
-
-	// Wake dispatcher for potential earlier scheduling
-	m.wakeDispatcher()
 }
 
 func (m *CronManager) dispatcher() {
@@ -391,37 +427,69 @@ func (m *CronManager) dispatcher() {
 				return
 			}
 
-			// Remove job from heap
-			heap.Pop(&m.jobHeap)
+			// Double-check the job is still at top of heap
+			if len(m.jobHeap) == 0 || m.jobHeap[0] != nextJob {
+				m.lock.Unlock()
+				continue
+			}
 
-			// Check if job should be skipped
+			// Double-check if job should be skipped
 			if atomic.LoadInt32(&nextJob.isRunning) == 1 {
-				// Job is already running, reschedule
-				m.rescheduleJobLocked(nextJob)
+				// Job is already running, skip this cycle
+				nextJob.nextRun = time.Now().Add(nextJob.Interval)
+				heap.Fix(&m.jobHeap, 0)
 				m.lock.Unlock()
 				continue
 			}
 
 			if atomic.CompareAndSwapInt32(&nextJob.skipNext, 1, 0) {
 				// Skip this cycle
-				m.rescheduleJobLocked(nextJob)
+				nextJob.nextRun = time.Now().Add(nextJob.Interval)
+				heap.Fix(&m.jobHeap, 0)
 				m.lock.Unlock()
 				continue
 			}
+
+			// Check if job is already running (without removing from heap yet)
+			if atomic.LoadInt32(&nextJob.isRunning) == 1 {
+				// Job is still running, update next run time in heap
+				nextJob.nextRun = time.Now().Add(nextJob.Interval)
+				heap.Fix(&m.jobHeap, 0)
+				m.lock.Unlock()
+				continue
+			}
+			
+			// Now try to atomically transition from not-running to running
+			if !atomic.CompareAndSwapInt32(&nextJob.isRunning, 0, 1) {
+				// Another goroutine just started running this job
+				nextJob.nextRun = time.Now().Add(nextJob.Interval)
+				heap.Fix(&m.jobHeap, 0)
+				m.lock.Unlock()
+				continue
+			}
+			
+			// We successfully claimed the job, now remove from heap
+			heap.Pop(&m.jobHeap)
+			atomic.StoreInt32(&nextJob.inHeap, 0)
+			
+			// Get current generation for this execution
+			generation := atomic.LoadInt64(&nextJob.generation)
 
 			m.lock.Unlock()
 
 			// Submit job to worker pool
 			jobExec := &jobExecution{
-				job:     nextJob,
-				manager: m,
-				timeout: nextJob.Interval, // Use interval as timeout
+				job:        nextJob,
+				manager:    m,
+				timeout:    nextJob.Interval, // Use interval as timeout
+				generation: generation,
 			}
 
 			if !m.workerPool.submit(jobExec) {
-				// Job was dropped, reschedule it
+				// Job was dropped, mark as not running and reschedule it
+				atomic.StoreInt32(&nextJob.isRunning, 0)
 				atomic.AddInt64(&m.jobsDropped, 1)
-				m.rescheduleJob(nextJob, false)
+				m.rescheduleJob(nextJob)
 			}
 
 		} else {
@@ -444,10 +512,6 @@ func (m *CronManager) dispatcher() {
 	}
 }
 
-func (m *CronManager) rescheduleJobLocked(job *CronJob) {
-	job.nextRun = time.Now().Add(job.Interval)
-	heap.Push(&m.jobHeap, job)
-}
 
 // Start spins up the dispatcher goroutine if not already running.
 // API-compatible method
