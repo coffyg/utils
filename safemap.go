@@ -1,12 +1,12 @@
 package utils
 
 import (
+	"hash/maphash"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 )
 
 // cacheLine is used to pad structs to prevent false sharing
@@ -54,6 +54,7 @@ type SafeMap[V any] struct {
 	shards     []*mapShard[V]
 	// Precomputed modMask for power-of-two shardCount
 	modMask uint32
+	seed    maphash.Seed
 }
 
 func NewSafeMap[V any]() *SafeMap[V] {
@@ -82,6 +83,7 @@ func NewSafeMapWithShardCount[V any](shardCount int) *SafeMap[V] {
 		shardCount: shardCount,
 		shards:     make([]*mapShard[V], shardCount),
 		modMask:    uint32(shardCount - 1), // For fast modulo with bitwise AND
+		seed:       maphash.MakeSeed(),
 	}
 	
 	for i := 0; i < shardCount; i++ {
@@ -92,66 +94,17 @@ func NewSafeMapWithShardCount[V any](shardCount int) *SafeMap[V] {
 	return sm
 }
 
-// xxHash64 is a faster, high-quality hashing algorithm
-func xxHash64(key string) uint32 {
-	const (
-		prime1 uint64 = 11400714785074694791
-		prime2 uint64 = 14029467366897019727
-		prime3 uint64 = 1609587929392839161
-		prime4 uint64 = 9650029242287828579
-		prime5 uint64 = 2870177450012600261
-	)
-
-	data := unsafe.Pointer(unsafe.StringData(key))
-	length := len(key)
-	var h64 uint64
-
-	if length >= 4 {
-		// Fast path for strings >= 4 bytes
-		h64 = uint64(length) * prime5
-		end := length & ^7 // Round down to multiple of 8
-		
-		for i := 0; i < end; i += 8 {
-			k1 := *(*uint64)(unsafe.Pointer(uintptr(data) + uintptr(i)))
-			k1 *= prime2
-			k1 = (k1 << 31) | (k1 >> 33) // rotl31
-			k1 *= prime1
-			h64 ^= k1
-			h64 = ((h64 << 27) | (h64 >> 37)) * prime1 + prime4
-		}
-
-		// Handle remaining bytes
-		for i := end; i < length; i++ {
-			h64 ^= uint64(*(*byte)(unsafe.Pointer(uintptr(data) + uintptr(i)))) * prime5
-			h64 = ((h64 << 17) | (h64 >> 47)) * prime3
-		}
-	} else {
-		// Short string optimization
-		h64 = uint64(length) * prime5
-		for i := 0; i < length; i++ {
-			h64 ^= uint64(*(*byte)(unsafe.Pointer(uintptr(data) + uintptr(i)))) * prime5
-			h64 = ((h64 << 17) | (h64 >> 47)) * prime3
-		}
-	}
-
-	h64 ^= h64 >> 33
-	h64 *= prime2
-	h64 ^= h64 >> 29
-	h64 *= prime3
-	h64 ^= h64 >> 32
-
-	return uint32(h64)
-}
-
 func (sm *SafeMap[V]) getShard(key string) *mapShard[V] {
 	// Fast lookup for common keys without sync.Map overhead
 	if internedKey, ok := commonKeyMap[key]; ok {
 		key = internedKey
 	}
+
+	hash := maphash.String(sm.seed, key)
 	
-	hash := xxHash64(key)
 	// Use bitwise AND with modMask instead of modulo
-	return sm.shards[hash&sm.modMask]
+	// explicit cast to uint32 is safe because modMask is small
+	return sm.shards[int(hash&uint64(sm.modMask))]
 }
 
 // isExpired is a non-locking helper that checks if an entry is expired

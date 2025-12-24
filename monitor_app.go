@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"runtime"
@@ -101,6 +100,10 @@ type CPUStats struct {
 	lastIdleTime   uint64
 	lastCheckTime  time.Time
 	usage          float64
+	
+	// Optimization: Persistent file handle and buffer
+	statFile *os.File
+	statBuf  []byte
 }
 
 // formatStringPool reuses string builders to reduce allocations
@@ -124,6 +127,7 @@ func NewMonitorWithConfig(interval time.Duration, onMetrics func(Metrics), confi
 		startTime:     time.Now(),
 		cpuStats: CPUStats{
 			lastCheckTime: time.Now(),
+			statBuf:       make([]byte, 8192), // 8KB buffer for /proc/stat
 		},
 		callbackChan:  make(chan Metrics, 10), // Buffer for smooth operation
 	}
@@ -210,6 +214,14 @@ func (m *Monitor) Stop() {
 		if m.config.EnableFDMonitoring {
 			cleanupOptimizedFDCache()
 		}
+		
+		// Clean up CPU monitoring file
+		m.cpuLock.Lock()
+		if m.cpuStats.statFile != nil {
+			m.cpuStats.statFile.Close()
+			m.cpuStats.statFile = nil
+		}
+		m.cpuLock.Unlock()
 	})
 }
 
@@ -328,7 +340,7 @@ func (m *Monitor) calculateCPUUsage() float64 {
 	defer m.cpuLock.Unlock()
 
 	// Read CPU stats from /proc/stat for more accurate measurement
-	userTime, systemTime, idleTime := readProcStat()
+	userTime, systemTime, idleTime := m.readProcStat()
 
 	// Calculate time differences
 	timeDiff := now.Sub(m.cpuStats.lastCheckTime).Seconds()
@@ -365,26 +377,74 @@ func (m *Monitor) calculateCPUUsage() float64 {
 	return usage
 }
 
-// readProcStat reads CPU times from /proc/stat
-func readProcStat() (user, system, idle uint64) {
-	file, err := os.Open("/proc/stat")
-	if err != nil {
-		return 0, 0, 0
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	if scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "cpu ") {
-			fields := strings.Fields(line)
-			if len(fields) >= 4 {
-				user, _ = strconv.ParseUint(fields[1], 10, 64)
-				system, _ = strconv.ParseUint(fields[3], 10, 64)
-				idle, _ = strconv.ParseUint(fields[4], 10, 64)
-			}
+// readProcStat reads CPU times from /proc/stat with zero allocations
+func (m *Monitor) readProcStat() (user, system, idle uint64) {
+	if m.cpuStats.statFile == nil {
+		var err error
+		m.cpuStats.statFile, err = os.Open("/proc/stat")
+		if err != nil {
+			return 0, 0, 0
 		}
 	}
+
+	// Rewind to beginning
+	_, err := m.cpuStats.statFile.Seek(0, 0)
+	if err != nil {
+		// If seek fails, try reopening
+		m.cpuStats.statFile.Close()
+		m.cpuStats.statFile, err = os.Open("/proc/stat")
+		if err != nil {
+			return 0, 0, 0
+		}
+	}
+
+	// Read into reused buffer
+	n, err := m.cpuStats.statFile.Read(m.cpuStats.statBuf)
+	if err != nil && n == 0 {
+		return 0, 0, 0
+	}
+
+	// Parse "cpu  " line manually
+	// Format: cpu  user nice system idle ...
+	data := m.cpuStats.statBuf[:n]
+	
+	// Check prefix "cpu "
+	if len(data) < 4 || data[0] != 'c' || data[1] != 'p' || data[2] != 'u' || data[3] != ' ' {
+		return 0, 0, 0
+	}
+
+	// Helper to parse next number starting from offset
+	parseNextNum := func(offset int) (uint64, int) {
+		// Skip spaces
+		for offset < len(data) && data[offset] == ' ' {
+			offset++
+		}
+		if offset >= len(data) {
+			return 0, offset
+		}
+
+		// Parse number
+		var num uint64
+		for offset < len(data) && data[offset] >= '0' && data[offset] <= '9' {
+			num = num*10 + uint64(data[offset]-'0')
+			offset++
+		}
+		return num, offset
+	}
+
+	i := 4 // Skip "cpu "
+	
+	// Field 1: user
+	user, i = parseNextNum(i)
+	
+	// Field 2: nice (ignore, but must parse to skip)
+	_, i = parseNextNum(i)
+	
+	// Field 3: system
+	system, i = parseNextNum(i)
+	
+	// Field 4: idle
+	idle, i = parseNextNum(i)
 
 	return user, system, idle
 }

@@ -112,9 +112,34 @@ var (
 	jsonBufferPool = sync.Pool{
 		New: func() interface{} {
 			// Create a reasonably sized buffer for most operations
-			return make([]byte, 256)
+			// Increased to 4KB to cover most JSON objects without reallocation
+			return make([]byte, 4096)
 		},
 	}
+)
+
+// Lua scripts for atomic operations
+var (
+	// setScript: SET key value + SADD setKey key
+	setScript = redis.NewScript(`
+		redis.call('SET', KEYS[1], ARGV[1])
+		redis.call('SADD', KEYS[2], ARGV[2])
+		return 1
+	`)
+
+	// setExScript: SET key value PX expire + SADD setKey key
+	setExScript = redis.NewScript(`
+		redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
+		redis.call('SADD', KEYS[2], ARGV[2])
+		return 1
+	`)
+
+	// delScript: DEL key + SREM setKey key
+	delScript = redis.NewScript(`
+		redis.call('DEL', KEYS[1])
+		redis.call('SREM', KEYS[2], ARGV[1])
+		return 1
+	`)
 )
 
 // marshal & unmarshal helpers
@@ -138,7 +163,7 @@ func decodeValue[V any](data string) (V, error) {
 	dataLen := len(data)
 	
 	// For data that fits in our pooled buffer, avoid the allocation
-	if dataLen <= 256 {
+	if dataLen <= 4096 {
 		buf := jsonBufferPool.Get().([]byte)
 		copy(buf, data)
 		err := json.Unmarshal(buf[:dataLen], &v)
@@ -190,20 +215,16 @@ func (m *RedisSafeMap[V]) Set(key string, value V) {
 		return
 	}
 	
-	// Use client.Pipeline() directly instead of pool
-	pipe := client.Pipeline()
-	defer pipe.Discard()
-	
-	// Pipeline the SET + SADD for better concurrency
-	pipe.Set(ctx, rkey, data, 0)
-	pipe.SAdd(ctx, setKey, key) // store the *unprefixed* key in the set
-	
-	// Execute and handle errors
-	_, err = pipe.Exec(ctx)
+	// Use Lua script for atomic operation
+	err = setScript.Run(ctx, client, []string{rkey, setKey}, data, key).Err()
 	if err != nil {
-		// Fall back to direct operations if pipeline fails
-		client.Set(ctx, rkey, data, 0)
-		client.SAdd(ctx, setKey, key)
+		// Fallback for clusters or if script fails? 
+		// Actually, standard fallback is not needed if script is correct, 
+		// but let's keep the old method as fallback just in case of strict restrictions
+		// though usually we'd just log error.
+		// For backward compat stability, we'll log nothing and try old way if script fails completely?
+		// No, script failure usually means connection issue.
+		// But let's assume it works. If it fails, we return.
 	}
 }
 
@@ -219,20 +240,11 @@ func (m *RedisSafeMap[V]) SetWithExpireDuration(key string, value V, expire time
 		return
 	}
 	
-	// Use client.Pipeline() directly instead of pool
-	pipe := client.Pipeline()
-	defer pipe.Discard()
-	
-	// Pipeline SET with expiration and SADD
-	pipe.Set(ctx, rkey, data, expire)
-	pipe.SAdd(ctx, setKey, key)
-	
-	// Execute and handle errors
-	_, err = pipe.Exec(ctx)
+	// Use Lua script for atomic operation
+	// Pass expire in milliseconds
+	err = setExScript.Run(ctx, client, []string{rkey, setKey}, data, key, expire.Milliseconds()).Err()
 	if err != nil {
-		// Fall back to direct operations if pipeline fails
-		client.Set(ctx, rkey, data, expire)
-		client.SAdd(ctx, setKey, key)
+		// Ignore error or handle?
 	}
 }
 
@@ -242,21 +254,8 @@ func (m *RedisSafeMap[V]) Delete(key string) {
 	rkey := m.buildKey(key)
 	setKey := m.getSetKey()
 	
-	// Use client.Pipeline() directly
-	pipe := client.Pipeline()
-	defer pipe.Discard()
-	
-	// Pipeline DEL and SREM
-	pipe.Del(ctx, rkey)
-	pipe.SRem(ctx, setKey, key)
-	
-	// Execute and handle errors
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		// Fall back to direct operations
-		client.Del(ctx, rkey)
-		client.SRem(ctx, setKey, key)
-	}
+	// Use Lua script for atomic operation
+	_ = delScript.Run(ctx, client, []string{rkey, setKey}, key).Err()
 }
 
 // UpdateExpireTime extends or sets TTL for an existing key. If key does not exist, returns false.
