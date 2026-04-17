@@ -562,3 +562,143 @@ func (sm *SafeMap[V]) DeleteAllKeysStartingWith(prefix string) {
 func (sm *SafeMap[V]) ExpiredAndGet(key string) (V, bool) {
 	return sm.Get(key)
 }
+
+// LoadOrStore atomically returns the existing value for the key if present,
+// otherwise stores and returns the given value. The loaded result is true if
+// the value was loaded, false if stored.
+// No expiration on stored value. Use LoadOrStoreWithExpireDuration for TTL.
+func (sm *SafeMap[V]) LoadOrStore(key string, value V) (actual V, loaded bool) {
+	return sm.LoadOrStoreWithExpireDuration(key, value, 0)
+}
+
+// LoadOrStoreWithExpireDuration is LoadOrStore with a TTL applied when storing.
+// If the value already exists (and is not expired), the existing value is
+// returned and the TTL is NOT refreshed.
+func (sm *SafeMap[V]) LoadOrStoreWithExpireDuration(key string, value V, expireDuration time.Duration) (actual V, loaded bool) {
+	shard := sm.getShard(key)
+	var expireTime int64
+	if expireDuration > 0 {
+		expireTime = time.Now().Add(expireDuration).UnixNano()
+	}
+	return shard.loadOrStore(key, value, expireTime)
+}
+
+func (s *mapShard[V]) loadOrStore(key string, value V, expireTime int64) (V, bool) {
+	now := time.Now().UnixNano()
+
+	// Lockless fast path — only valid if the entry exists and is unexpired.
+	readOnly := s.readOnly.Load().(readOnlyMap[V])
+	if entry, ok := readOnly.m[key]; ok && !isExpired(entry, now) {
+		return entry.value.Load().(V), true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Re-check readOnly under lock.
+	readOnly = s.readOnly.Load().(readOnlyMap[V])
+	if entry, ok := readOnly.m[key]; ok {
+		if !isExpired(entry, now) {
+			return entry.value.Load().(V), true
+		}
+		// Expired — overwrite in-place.
+		entry.value.Store(value)
+		atomic.StoreInt64(&entry.expireTime, expireTime)
+		return value, false
+	}
+
+	// Check dirty map.
+	if readOnly.amended && s.dirty != nil {
+		if entry, ok := s.dirty[key]; ok {
+			if !isExpired(entry, now) {
+				return entry.value.Load().(V), true
+			}
+			entry.value.Store(value)
+			atomic.StoreInt64(&entry.expireTime, expireTime)
+			return value, false
+		}
+	}
+
+	// Not found — insert new entry in dirty.
+	if s.dirty == nil {
+		s.dirtyLocked()
+		readOnly = s.readOnly.Load().(readOnlyMap[V])
+		s.readOnly.Store(readOnlyMap[V]{m: readOnly.m, amended: true})
+	}
+	newEntry := &mapEntry[V]{}
+	newEntry.value.Store(value)
+	atomic.StoreInt64(&newEntry.expireTime, expireTime)
+	s.dirty[key] = newEntry
+	return value, false
+}
+
+// Update atomically reads the current value (zero value if missing or expired)
+// and stores the result of updater(old, existed). The returned value is the
+// stored result. The shard mutex is held for the duration of updater — keep
+// it short and non-blocking.
+// expireDuration=0 means no expiration.
+func (sm *SafeMap[V]) Update(key string, expireDuration time.Duration, updater func(old V, existed bool) V) V {
+	shard := sm.getShard(key)
+	var expireTime int64
+	if expireDuration > 0 {
+		expireTime = time.Now().Add(expireDuration).UnixNano()
+	}
+	return shard.update(key, expireTime, updater)
+}
+
+func (s *mapShard[V]) update(key string, expireTime int64, updater func(old V, existed bool) V) V {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UnixNano()
+
+	// Check readOnly first.
+	readOnly := s.readOnly.Load().(readOnlyMap[V])
+	if entry, ok := readOnly.m[key]; ok {
+		if !isExpired(entry, now) {
+			old := entry.value.Load().(V)
+			newVal := updater(old, true)
+			entry.value.Store(newVal)
+			atomic.StoreInt64(&entry.expireTime, expireTime)
+			return newVal
+		}
+		// Expired — reuse the slot as if missing.
+		var zero V
+		newVal := updater(zero, false)
+		entry.value.Store(newVal)
+		atomic.StoreInt64(&entry.expireTime, expireTime)
+		return newVal
+	}
+
+	// Check dirty (if amended).
+	if readOnly.amended && s.dirty != nil {
+		if entry, ok := s.dirty[key]; ok {
+			if !isExpired(entry, now) {
+				old := entry.value.Load().(V)
+				newVal := updater(old, true)
+				entry.value.Store(newVal)
+				atomic.StoreInt64(&entry.expireTime, expireTime)
+				return newVal
+			}
+			var zero V
+			newVal := updater(zero, false)
+			entry.value.Store(newVal)
+			atomic.StoreInt64(&entry.expireTime, expireTime)
+			return newVal
+		}
+	}
+
+	// Truly missing — insert fresh into dirty.
+	if s.dirty == nil {
+		s.dirtyLocked()
+		readOnly = s.readOnly.Load().(readOnlyMap[V])
+		s.readOnly.Store(readOnlyMap[V]{m: readOnly.m, amended: true})
+	}
+	var zero V
+	newVal := updater(zero, false)
+	newEntry := &mapEntry[V]{}
+	newEntry.value.Store(newVal)
+	atomic.StoreInt64(&newEntry.expireTime, expireTime)
+	s.dirty[key] = newEntry
+	return newVal
+}
