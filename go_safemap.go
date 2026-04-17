@@ -202,6 +202,97 @@ func (sm *SafeMapGo[V]) DeleteAllKeysStartingWith(prefix string) {
 	}
 }
 
+// LoadOrStore atomically returns the existing value for the key if present,
+// otherwise stores and returns the given value. loaded=true if the value was
+// loaded, false if stored. Expired entries are treated as missing and
+// overwritten.
+// No expiration on stored value. Use LoadOrStoreWithExpireDuration for TTL.
+func (sm *SafeMapGo[V]) LoadOrStore(key string, value V) (V, bool) {
+	return sm.LoadOrStoreWithExpireDuration(key, value, 0)
+}
+
+// LoadOrStoreWithExpireDuration is LoadOrStore with a TTL applied when storing.
+// If the value already exists (and is not expired), the existing value is
+// returned and the TTL is NOT refreshed.
+func (sm *SafeMapGo[V]) LoadOrStoreWithExpireDuration(key string, value V, expireDuration time.Duration) (V, bool) {
+	var expireTime int64
+	if expireDuration > 0 {
+		expireTime = time.Now().Add(expireDuration).UnixNano()
+	}
+	newEntry := &mapEntryGo[V]{value: value, expireTime: expireTime}
+
+	for {
+		actual, loaded := sm.m.LoadOrStore(key, newEntry)
+		if !loaded {
+			return value, false
+		}
+		existing, ok := actual.(*mapEntryGo[V])
+		if !ok {
+			// Corrupt entry — try to overwrite.
+			sm.m.Delete(key)
+			continue
+		}
+		// Expired? Try to swap in the new entry atomically.
+		if existing.expireTime != 0 && time.Now().UnixNano() > existing.expireTime {
+			if sm.m.CompareAndSwap(key, actual, newEntry) {
+				return value, false
+			}
+			// Another goroutine raced us — retry.
+			continue
+		}
+		return existing.value, true
+	}
+}
+
+// Update atomically reads the current value (zero value if missing or expired)
+// and stores the result of updater(old, existed). The returned value is the
+// stored result.
+//
+// Uses an optimistic CAS loop. The updater may be invoked MORE than once
+// under contention (same semantics as Go's sync/atomic CAS loops) — keep it
+// pure and cheap. Do not perform side effects inside updater.
+// expireDuration=0 means no expiration.
+func (sm *SafeMapGo[V]) Update(key string, expireDuration time.Duration, updater func(old V, existed bool) V) V {
+	var expireTime int64
+	if expireDuration > 0 {
+		expireTime = time.Now().Add(expireDuration).UnixNano()
+	}
+	for {
+		var old V
+		var existed bool
+		actual, loaded := sm.m.Load(key)
+		if loaded {
+			existing, ok := actual.(*mapEntryGo[V])
+			if !ok {
+				sm.m.Delete(key)
+				continue
+			}
+			if existing.expireTime != 0 && time.Now().UnixNano() > existing.expireTime {
+				// Expired — treat as missing.
+				existed = false
+			} else {
+				old = existing.value
+				existed = true
+			}
+		}
+		newVal := updater(old, existed)
+		newEntry := &mapEntryGo[V]{value: newVal, expireTime: expireTime}
+		if !loaded {
+			// Try to insert — only succeeds if nobody else inserted meanwhile.
+			if _, inserted := sm.m.LoadOrStore(key, newEntry); !inserted {
+				return newVal
+			}
+			// Someone else inserted. Retry.
+			continue
+		}
+		// Existing entry — CAS to replace it.
+		if sm.m.CompareAndSwap(key, actual, newEntry) {
+			return newVal
+		}
+		// CAS lost — retry.
+	}
+}
+
 // mapEntryGo is the internal structure for storing values with expiration
 type mapEntryGo[V any] struct {
 	value      V

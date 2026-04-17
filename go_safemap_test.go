@@ -543,3 +543,102 @@ func benchmarkDeleteAllKeysOperationGo(b *testing.B, sm *SafeMapGo[int], mapSize
 		}
 	}
 }
+func TestSafeMapGoLoadOrStore(t *testing.T) {
+	sm := NewSafeMapGo[int]()
+
+	actual, loaded := sm.LoadOrStore("a", 10)
+	if loaded || actual != 10 {
+		t.Fatalf("expected stored value 10, got (%v, loaded=%v)", actual, loaded)
+	}
+	actual, loaded = sm.LoadOrStore("a", 99)
+	if !loaded || actual != 10 {
+		t.Fatalf("expected loaded value 10, got (%v, loaded=%v)", actual, loaded)
+	}
+
+	sm.SetWithExpireDuration("b", 5, 1*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+	actual, loaded = sm.LoadOrStoreWithExpireDuration("b", 7, 1*time.Minute)
+	if loaded || actual != 7 {
+		t.Fatalf("expected stored 7 after expiry, got (%v, loaded=%v)", actual, loaded)
+	}
+}
+
+func TestSafeMapGoLoadOrStoreConcurrent(t *testing.T) {
+	sm := NewSafeMapGo[int]()
+	var wg sync.WaitGroup
+	var loadedCount, storedCount int64
+	var mu sync.Mutex
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(v int) {
+			defer wg.Done()
+			_, loaded := sm.LoadOrStore("race", v)
+			mu.Lock()
+			defer mu.Unlock()
+			if loaded {
+				loadedCount++
+			} else {
+				storedCount++
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if storedCount != 1 {
+		t.Fatalf("expected exactly 1 store, got %d", storedCount)
+	}
+	if loadedCount != 99 {
+		t.Fatalf("expected 99 loads, got %d", loadedCount)
+	}
+}
+
+func TestSafeMapGoUpdateConcurrentIncrement(t *testing.T) {
+	sm := NewSafeMapGo[int]()
+	const N = 1000
+	var wg sync.WaitGroup
+
+	incr := func(old int, existed bool) int {
+		if !existed {
+			return 1
+		}
+		return old + 1
+	}
+
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sm.Update("counter", 1*time.Minute, incr)
+		}()
+	}
+	wg.Wait()
+
+	final, ok := sm.Get("counter")
+	if !ok {
+		t.Fatalf("counter missing after concurrent updates")
+	}
+	if final != N {
+		t.Fatalf("expected final counter=%d, got %d — TOCTOU leak?", N, final)
+	}
+}
+
+func TestSafeMapGoUpdateExpiredTreatedAsMissing(t *testing.T) {
+	sm := NewSafeMapGo[int]()
+	sm.SetWithExpireDuration("k", 42, 1*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+
+	var sawExisted bool
+	sm.Update("k", 1*time.Minute, func(old int, existed bool) int {
+		sawExisted = existed
+		return 1
+	})
+	if sawExisted {
+		t.Fatalf("expired entry should be reported as !existed")
+	}
+
+	v, ok := sm.Get("k")
+	if !ok || v != 1 {
+		t.Fatalf("expected 1 after update on expired key, got (%v, ok=%v)", v, ok)
+	}
+}
